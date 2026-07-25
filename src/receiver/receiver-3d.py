@@ -192,6 +192,15 @@ class Receiver():
         self.lost_frames_full           = 0     # no chunks arrived at all
         self.lost_frames_partial        = 0     # DESC arrived but some chunks missing
 
+        # ── Sender feedback ──────────────────────────────────────────────────
+        # The receiver periodically reports how many frames missed their display
+        # deadline, so the sender can lower quality before more frames are lost.
+        self.feedback_channel   = None  # rgb DataChannel, captured when it opens
+        self.loop               = None  # event loop, for sends from worker threads
+        self.fb_interval        = 30    # frames between reports (~1 s at 30 fps)
+        self.fb_last_sent_frame = 0     # frame id of the previous report
+        self.fb_last_missed     = 0     # miss count at the previous report
+
         # ── GOP / P-frame continuity ─────────────────────────────────────────
         # Tracks which I-frame the decoder last successfully decoded.
         # P-frames that belong to an older GOP are discarded to avoid artifacts.
@@ -480,6 +489,27 @@ class Receiver():
                 self.done_fids.add(fid)
                 self.frame_content.pop(fid, None)
 
+                # Report the deadline-miss rate over the frames since the last
+                # report.  The span of frame ids is used as the denominator
+                # rather than a counter of frames seen here: misses are recorded
+                # from several points in the pipeline, so counting locally would
+                # understate the total and let the ratio exceed 100%.
+                missed = self.lost_frames_full + self.lost_frames_partial
+                span   = fid - self.fb_last_sent_frame
+                if span >= self.fb_interval:
+                    rate = min(100.0, 100.0 * (missed - self.fb_last_missed) / max(1, span))
+                    self.fb_last_sent_frame = fid
+                    self.fb_last_missed     = missed
+                    # Runs on the decode worker thread, so the send has to be
+                    # handed back to the event loop that owns the DataChannel.
+                    if self.feedback_channel is not None and self.loop is not None:
+                        try:
+                            self.loop.call_soon_threadsafe(
+                                self.feedback_channel.send, f"FB:{rate:.1f}")
+                            logging.info(f"[Feedback] miss_rate={rate:.1f}% at frame {fid}")
+                        except Exception as exc:
+                            logging.warning(f"[Feedback] send failed: {exc}")
+
             # ── Decode ───────────────────────────────────────────────────────
             frame_rgb   = None
             frame_depth = None
@@ -663,6 +693,8 @@ class Receiver():
         Connect to the signaling server, negotiate WebRTC, receive the stream,
         and save both RGB and depth videos on completion.
         """
+        # Kept so worker threads can schedule feedback sends onto this loop.
+        self.loop = asyncio.get_running_loop()
         self.cfg = RTCConfiguration([RTCIceServer(urls=[self.stun_url])])
         self.pc  = RTCPeerConnection(configuration=self.cfg)
 
@@ -680,6 +712,9 @@ class Receiver():
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             logging.info("Receiver: DataChannel %s created", channel.label)
+            # Feedback is sent back over the RGB channel, which is bidirectional.
+            if channel.label == "rgb_payload":
+                self.feedback_channel = channel
 
             @channel.on("message")
             async def on_message(msg):
@@ -825,8 +860,11 @@ class Receiver():
                             logging.info("[Receiver] Received bye — draining remaining frames (100 ms)")
                             await asyncio.sleep(0.1)
                             self.stop_threads.set()
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                            # Skipped on CPU-only hosts, where these raise and
+                            # would abort the run before the videos are written.
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
                             gc.collect()
                             logging.info("Closing WebSocket and stopping")
                             break
