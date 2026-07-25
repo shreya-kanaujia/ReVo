@@ -55,6 +55,23 @@ logging.basicConfig(level=logging.INFO)
 # Prevents memory bloat if the network is slower than the encode rate.
 BUFFERED_WATERMARK_HARD = 128 * 1024  # 128 KB
 
+# ── Adaptive quality ─────────────────────────────────────────────────────────
+# When enabled, every frame is encoded at two quality levels and the sender
+# transmits the low-quality copy while the link is under stress, instead of
+# dropping the frame outright.  Settings are read from the environment so a run
+# can be configured without editing the source.
+#
+#   SALSIFY_MODE=0       reproduces the unmodified drop-on-full behaviour
+#   SALSIFY_SOFT_FRAC    fraction of BUFFERED_WATERMARK_HARD above which the
+#                        sender degrades (sender-side congestion)
+#   SALSIFY_MISS_THRESH  receiver-reported deadline-miss rate, in percent,
+#                        above which the sender degrades (loss or lateness)
+SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "0"))
+SALSIFY_QP_HI       = int(os.environ.get("SALSIFY_QP_HI", "20"))
+SALSIFY_QP_LO       = int(os.environ.get("SALSIFY_QP_LO", "30"))
+SALSIFY_SOFT_FRAC   = float(os.environ.get("SALSIFY_SOFT_FRAC", "0.5"))
+SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "5.0"))
+
 FPS_FALLBACK = 30  # used when the video file has no metadata fps
 
 # ---------------------------------------------------------------------------
@@ -116,20 +133,34 @@ class Sender():
         self.data_channel_rgb  = None
         self.data_channel_depth= None
 
+        # ── Adaptive-quality state ───────────────────────────────────────────
+        self.recv_miss_rate  = 0.0      # deadline-miss rate last reported by the receiver (%)
+        self.salsify_lo_mode = False    # True while the current GOP is sent at low quality
+        self.salsify_streak  = 0        # consecutive GOPs disagreeing with lo_mode
+
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
-        self.codec = h265.H265VideoCodec(intra_period=30)
+        self.codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_QP_HI)
         if args.codec == "dcvcrt":
             self.codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
             self.codec = h264.H264VideoCodec(intra_period=30)
 
         # Depth codec (mirrors RGB codec choice)
-        self.depth_codec = h265.H265VideoCodec(intra_period=30)
+        self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_QP_HI)
         if args.codec == "dcvcrt":
             self.depth_codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
             self.depth_codec = h264.H264VideoCodec(intra_period=30)
+
+        # ── Low-quality encoders (adaptive mode, H.265 only) ─────────────────
+        # A second encoder per stream at a higher QP.  Both encoders compress
+        # every frame so each keeps a continuous reference chain; the send loop
+        # only chooses which of the two outputs to transmit.
+        self.codec_lo = self.depth_codec_lo = None
+        if SALSIFY_MODE and args.codec == "h265":
+            self.codec_lo       = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_QP_LO)
+            self.depth_codec_lo = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_QP_LO)
 
         # ── Byte / frame counters ────────────────────────────────────────────
         self.total_bytes_sent           = 0
@@ -291,6 +322,12 @@ class Sender():
             def encode_rgb(raw_tensor, fid, current_fps):
                 return list(self.codec.compress_stream(raw_tensor, fid, fps=current_fps))
 
+            def encode_rgb_lo(raw_tensor, fid, current_fps):
+                return list(self.codec_lo.compress_stream(raw_tensor, fid, fps=current_fps))
+
+            def encode_depth_lo(raw_tensor, fid, current_fps):
+                return list(self.depth_codec_lo.compress_stream(raw_tensor, fid, fps=current_fps))
+
             def encode_depth(raw_tensor, fid, current_fps):
                 return list(self.depth_codec.compress_stream(raw_tensor, fid, fps=current_fps))
 
@@ -317,6 +354,14 @@ class Sender():
                 task_rgb   = asyncio.to_thread(encode_rgb,   raw,       frame_id, fps)
                 task_depth = asyncio.to_thread(encode_depth, raw_depth, frame_id, fps)
                 packet_list, packet_list_depth = await asyncio.gather(task_rgb, task_depth)
+
+                # Encode the low-quality copy of the same frame in parallel.
+                packet_list_lo       = []
+                packet_list_depth_lo = []
+                if SALSIFY_MODE and self.codec_lo is not None:
+                    packet_list_lo, packet_list_depth_lo = await asyncio.gather(
+                        asyncio.to_thread(encode_rgb_lo,   raw,       frame_id, fps),
+                        asyncio.to_thread(encode_depth_lo, raw_depth, frame_id, fps))
 
                 t_send0 = time.perf_counter()
                 if self.trace_t0_sender is None:
@@ -346,14 +391,54 @@ class Sender():
                         self.gop_id_depth = out_fid
                     gop_id = self.gop_id
 
-                    # ── Back-pressure check ──────────────────────────────────
-                    # Drop the frame if either channel's send buffer is full.
-                    if self.data_channel_rgb.bufferedAmount > BUFFERED_WATERMARK_HARD:
-                        logging.warning(f"[Sender] RGB buffer full — dropping frame {out_fid}")
-                        break
-                    if self.data_channel_depth.bufferedAmount > BUFFERED_WATERMARK_HARD:
-                        logging.warning(f"[Sender] Depth buffer full — dropping frame {out_fid}")
-                        break
+                    # ── Back-pressure / quality selection ────────────────────
+                    ba = max(self.data_channel_rgb.bufferedAmount,
+                             self.data_channel_depth.bufferedAmount)
+                    if not SALSIFY_MODE:
+                        # BASELINE: drop the frame if either buffer is full.
+                        if self.data_channel_rgb.bufferedAmount > BUFFERED_WATERMARK_HARD:
+                            logging.warning(f"[Sender] RGB buffer full — dropping frame {out_fid}")
+                            break
+                        if self.data_channel_depth.bufferedAmount > BUFFERED_WATERMARK_HARD:
+                            logging.warning(f"[Sender] Depth buffer full — dropping frame {out_fid}")
+                            break
+                    else:
+                        # Degrade to the low-quality copy rather than dropping.
+                        # The choice is made once per GOP, at the I-frame: the two
+                        # encoders keep independent reference chains, so switching
+                        # mid-GOP would leave the receiver holding P-frames that
+                        # reference frames it never received.
+                        if is_key:
+                            pressure = (ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
+                                        or self.recv_miss_rate > SALSIFY_MISS_THRESH)
+                            # Require two consecutive GOPs to agree before
+                            # switching, so one burst cannot make quality oscillate.
+                            if pressure != self.salsify_lo_mode:
+                                self.salsify_streak += 1
+                                if self.salsify_streak >= 2:
+                                    self.salsify_lo_mode = pressure
+                                    self.salsify_streak  = 0
+                            else:
+                                self.salsify_streak = 0
+                            logging.info(
+                                f"[Adaptive] GOP {out_fid}: low_quality={self.salsify_lo_mode} "
+                                f"(buffered={ba} B, miss_rate={self.recv_miss_rate:.1f}%)")
+                        if ba > BUFFERED_WATERMARK_HARD:
+                            # Even the low-quality copy will not fit.
+                            logging.warning(f"[Sender] send buffer full — dropping frame {out_fid}")
+                            break
+
+                        sent_low = False
+                        if self.salsify_lo_mode and packet_list_lo:
+                            lo   = next((o for o in packet_list_lo       if o["frame_id"] == out_fid), None)
+                            lo_d = next((o for o in packet_list_depth_lo if o["frame_id"] == out_fid), None)
+                            
+                            if lo is not None and lo_d is not None:
+                                payload,       qp       = lo["payload"],   lo["qp"]
+                                payload_depth, qp_depth = lo_d["payload"], lo_d["qp"]
+                                sent_low = True
+                        logging.info(f"[Adaptive] frame {out_fid} "
+                                     f"{'low' if sent_low else 'high'} qp={qp} buffered={ba} B")
 
                     # ── Chunk / shard preparation ────────────────────────────
                     if is_key:
@@ -593,6 +678,18 @@ class Sender():
         def on_depth_open():
             logging.info("depth_payload channel open")
             self.p_open.set()
+
+        @self.data_channel_rgb.on("message")
+        def on_rgb_message(msg):
+            # Receiver reports its deadline-miss rate as "FB:<percent>".
+            try:
+                if isinstance(msg, bytes):
+                    msg = msg.decode("utf-8")
+                if isinstance(msg, str) and msg.startswith("FB:"):
+                    self.recv_miss_rate = float(msg[3:])
+                    logging.info(f"[Feedback] miss_rate={self.recv_miss_rate:.1f}%")
+            except Exception as exc:
+                logging.warning(f"[Feedback] could not parse '{msg}': {exc}")
 
         @self.data_channel_rgb.on("close")
         def on_rgb_close():
