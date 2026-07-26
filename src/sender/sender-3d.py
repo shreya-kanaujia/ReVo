@@ -42,6 +42,14 @@ import os
 import subprocess
 import sys
 import bisect
+import csv
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from webrtc_diagnostics import (
+    WebRTCDiagnostics,
+    apply_ice_consent_timeout,
+    enable_ice_debug_logging,
+)
 
 # ANSI color codes for log readability
 RED   = "\033[31m"
@@ -64,6 +72,8 @@ MSG_INIT         = 1   # one-time stream parameters
 MSG_DESC         = 2   # per-chunk descriptor (precedes every data shard)
 FRAME_TYPE_RGB   = 3
 FRAME_TYPE_DEPTH = 4
+MSG_PROBE        = 5   # validation-only packet train probe
+MSG_CAPACITY_FEEDBACK = 6
 
 # ---------------------------------------------------------------------------
 # Binary wire formats (little-endian)
@@ -73,13 +83,18 @@ FRAME_TYPE_DEPTH = 4
 #
 # DESC  – type:u8 | frame_type:u8 | frame_id:u32 | gop_id:u32
 #           | qp:u8 | chunk_idx:u16 | num_chunks(n):u16
-#           | k_data:u16 | total_size:u32
+#           | k_data:u16 | total_size:u32 | seq_id:u64
+#           | sender_send_ts:f64 | sender_grace_period:f64
 #         (raw shard bytes follow immediately after)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIQdd"
+FMT_PROBE = "<BQIIHd"
+FMT_CAPACITY_FEEDBACK = "<BQIddddd"
 SZ_INIT  = struct.calcsize(FMT_INIT)
 SZ_DESC  = struct.calcsize(FMT_DESC)
+SZ_PROBE = struct.calcsize(FMT_PROBE)
+SZ_CAPACITY_FEEDBACK = struct.calcsize(FMT_CAPACITY_FEEDBACK)
 
 
 class Sender():
@@ -115,6 +130,8 @@ class Sender():
         self.pc                = None
         self.data_channel_rgb  = None
         self.data_channel_depth= None
+        self.ice_consent_timeout_s = args.ice_consent_timeout_s
+        self._ice_consent_timeout_applied = False
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
@@ -163,9 +180,252 @@ class Sender():
         self.trace_duration    = None
         self.trace_t0_sender   = None  # wall time when first data chunk is sent
 
+        # ── Passive capacity-estimator state ────────────────────────────────
+        self.next_packet_seq = 1
+        self.last_sent_sequence = 0
+        self.last_acknowledged_sequence = 0
+        self.last_packet_send_ts = None
+        self.outstanding_packets = {}  # seq_id -> packet byte length
+        if args.diagnostic_ice:
+            enable_ice_debug_logging()
+        self.diagnostics = WebRTCDiagnostics(args.diagnostic_csv, "sender")
+        self.capacity_delay_target_s = float(args.capacity_delay_target)
+        self.capacity_csv_path = args.capacity_csv
+        self.capacity_file = None
+        self.capacity_writer = None
+        self._open_capacity_log()
+
+        # Validation-only probe logging. This is separate from normal ReVo frames.
+        self.probe_sender_csv_path = args.probe_sender_csv
+        self.probe_sender_file = None
+        self.probe_sender_writer = None
+        self._open_probe_sender_log()
+
+        # Passive Week 1A measurements; this does not feed back into send logic.
+        self.measurement_csv_path = args.measurement_csv
+        self.measurement_file = None
+        self.measurement_writer = None
+        self._open_measurement_log()
+
     # ────────────────────────────────────────────────────────────────────────
     # Network trace (tc qdisc) control
     # ────────────────────────────────────────────────────────────────────────
+
+    def _open_measurement_log(self):
+        if not self.measurement_csv_path:
+            return
+        parent = os.path.dirname(os.path.abspath(self.measurement_csv_path))
+        os.makedirs(parent, exist_ok=True)
+        self.measurement_file = open(self.measurement_csv_path, "w", newline="")
+        self.measurement_writer = csv.DictWriter(
+            self.measurement_file,
+            fieldnames=[
+                "timestamp_monotonic",
+                "frame_id",
+                "stream",
+                "frame_type",
+                "encoded_frame_size_bytes",
+                "num_chunks",
+                "chunk_size",
+                "buffered_amount_before_send",
+                "buffered_watermark_hard",
+                "sent",
+                "drop_reason",
+                "send_start_monotonic",
+                "send_end_monotonic",
+            ],
+        )
+        self.measurement_writer.writeheader()
+
+    def _log_frame_measurement(self, *, frame_id, stream, is_key, encoded_size,
+                               num_chunks, chunk_size, buffered_before, sent,
+                               drop_reason="", send_start=None, send_end=None):
+        if self.measurement_writer is None:
+            return
+        self.measurement_writer.writerow({
+            "timestamp_monotonic": f"{time.perf_counter():.9f}",
+            "frame_id": int(frame_id),
+            "stream": stream,
+            "frame_type": "I" if is_key else "P",
+            "encoded_frame_size_bytes": int(encoded_size),
+            "num_chunks": int(num_chunks),
+            "chunk_size": int(chunk_size),
+            "buffered_amount_before_send": int(buffered_before),
+            "buffered_watermark_hard": int(BUFFERED_WATERMARK_HARD),
+            "sent": "1" if sent else "0",
+            "drop_reason": drop_reason,
+            "send_start_monotonic": "" if send_start is None else f"{send_start:.9f}",
+            "send_end_monotonic": "" if send_end is None else f"{send_end:.9f}",
+        })
+        self.measurement_file.flush()
+
+    def _close_measurement_log(self):
+        if self.measurement_file is not None:
+            self.measurement_file.close()
+            self.measurement_file = None
+            self.measurement_writer = None
+
+    def _open_capacity_log(self):
+        if not self.capacity_csv_path:
+            return
+        parent = os.path.dirname(os.path.abspath(self.capacity_csv_path))
+        os.makedirs(parent, exist_ok=True)
+        self.capacity_file = open(self.capacity_csv_path, "w", newline="")
+        self.capacity_writer = csv.DictWriter(
+            self.capacity_file,
+            fieldnames=[
+                "timestamp",
+                "acknowledged_sequence_number",
+                "last_sent_sequence_number",
+                "packets_outstanding",
+                "outstanding_packets",
+                "raw_interarrival_time",
+                "sender_grace_period",
+                "corrected_interarrival_time",
+                "smoothed_tau",
+                "packet_size_bytes",
+                "estimated_packet_service_rate",
+                "estimated_capacity_bytes_per_sec",
+                "estimated_capacity_mbps",
+                "max_frame_size_bytes",
+                "rgb_bufferedAmount",
+                "depth_bufferedAmount",
+            ],
+        )
+        self.capacity_writer.writeheader()
+
+    def _close_capacity_log(self):
+        if self.capacity_file is not None:
+            self.capacity_file.close()
+            self.capacity_file = None
+            self.capacity_writer = None
+
+    def _open_probe_sender_log(self):
+        if not self.probe_sender_csv_path:
+            return
+        parent = os.path.dirname(os.path.abspath(self.probe_sender_csv_path))
+        os.makedirs(parent, exist_ok=True)
+        self.probe_sender_file = open(self.probe_sender_csv_path, "w", newline="")
+        self.probe_sender_writer = csv.DictWriter(
+            self.probe_sender_file,
+            fieldnames=[
+                "timestamp_monotonic",
+                "probe_sequence_id",
+                "payload_bytes",
+                "target_offered_bitrate_mbps",
+                "target_packet_interval_seconds",
+                "actual_send_interval_seconds",
+                "scheduling_lateness_seconds",
+                "datachannel_bufferedAmount",
+                "sent",
+                "paused_due_to_backpressure",
+                "cumulative_probe_bytes_sent",
+            ],
+        )
+        self.probe_sender_writer.writeheader()
+
+    def _close_probe_sender_log(self):
+        if self.probe_sender_file is not None:
+            self.probe_sender_file.close()
+            self.probe_sender_file = None
+            self.probe_sender_writer = None
+
+    def _log_probe_sender(self, *, timestamp, seq_id, payload_bytes, bitrate_mbps,
+                          packet_interval, actual_interval, lateness,
+                          buffered_amount, sent, paused, cumulative_bytes):
+        if self.probe_sender_writer is None:
+            return
+        self.probe_sender_writer.writerow({
+            "timestamp_monotonic": f"{float(timestamp):.9f}",
+            "probe_sequence_id": "" if seq_id is None else int(seq_id),
+            "payload_bytes": int(payload_bytes),
+            "target_offered_bitrate_mbps": f"{float(bitrate_mbps):.9f}",
+            "target_packet_interval_seconds": f"{float(packet_interval):.9f}",
+            "actual_send_interval_seconds": "" if actual_interval is None else f"{float(actual_interval):.9f}",
+            "scheduling_lateness_seconds": f"{float(lateness):.9f}",
+            "datachannel_bufferedAmount": int(buffered_amount),
+            "sent": "1" if sent else "0",
+            "paused_due_to_backpressure": "1" if paused else "0",
+            "cumulative_probe_bytes_sent": int(cumulative_bytes),
+        })
+        self.probe_sender_file.flush()
+
+    @staticmethod
+    def _fmt_float(value):
+        return "" if value is None else f"{float(value):.9f}"
+
+    def _handle_feedback_message(self, msg):
+        if isinstance(msg, bytes):
+            if len(msg) != SZ_CAPACITY_FEEDBACK or msg[0] != MSG_CAPACITY_FEEDBACK:
+                return
+            (_mtype, seq_id, packet_size, receiver_ts, raw, grace,
+             corrected, ewma) = struct.unpack(FMT_CAPACITY_FEEDBACK, msg)
+            feedback = {
+                "type": "capacity_feedback",
+                "seq_id": int(seq_id),
+                "packet_size": int(packet_size),
+                "receiver_ts": receiver_ts,
+                "raw_interarrival": None if raw < 0 else raw,
+                "sender_grace_period": grace,
+                "corrected_interarrival": None if corrected < 0 else corrected,
+                "ewma_interarrival": None if ewma < 0 else ewma,
+            }
+        elif isinstance(msg, str):
+            try:
+                feedback = json.loads(msg)
+            except json.JSONDecodeError:
+                return
+            if feedback.get("type") != "capacity_feedback":
+                return
+        else:
+            return
+
+        seq_id = int(feedback.get("seq_id", 0))
+        self.diagnostics.feedback_event(seq_id)
+        packet_size = int(feedback.get("packet_size", 0))
+        if seq_id > self.last_acknowledged_sequence:
+            self.last_acknowledged_sequence = seq_id
+        acknowledged_bytes = self.outstanding_packets.pop(seq_id, packet_size)
+        ewma = feedback.get("ewma_interarrival")
+        packets_outstanding = max(0, self.last_sent_sequence - self.last_acknowledged_sequence)
+        capacity_bps = None
+        service_rate_pps = None
+        max_frame_size = None
+        if ewma is not None and float(ewma) > 0 and acknowledged_bytes > 0:
+            service_rate_pps = 1.0 / float(ewma)
+            capacity_bps = float(packet_size or acknowledged_bytes) * service_rate_pps
+            max_frame_size = float(packet_size or acknowledged_bytes) * (
+                self.capacity_delay_target_s * service_rate_pps - packets_outstanding
+            )
+            max_frame_size = max(0.0, max_frame_size)
+        capacity_mbps = None if capacity_bps is None else capacity_bps * 8.0 / 1_000_000.0
+
+        logging.debug(
+            "[Estimator] ack seq=%d last_sent=%d outstanding=%d tau=%s max_frame=%s",
+            seq_id, self.last_sent_sequence, packets_outstanding,
+            self._fmt_float(ewma), self._fmt_float(max_frame_size)
+        )
+
+        if self.capacity_writer is not None:
+            self.capacity_writer.writerow({
+                "timestamp": f"{time.perf_counter():.9f}",
+                "acknowledged_sequence_number": seq_id,
+                "last_sent_sequence_number": self.last_sent_sequence,
+                "packets_outstanding": packets_outstanding,
+                "outstanding_packets": packets_outstanding,
+                "raw_interarrival_time": self._fmt_float(feedback.get("raw_interarrival")),
+                "sender_grace_period": self._fmt_float(feedback.get("sender_grace_period")),
+                "corrected_interarrival_time": self._fmt_float(feedback.get("corrected_interarrival")),
+                "smoothed_tau": self._fmt_float(ewma),
+                "packet_size_bytes": packet_size,
+                "estimated_packet_service_rate": self._fmt_float(service_rate_pps),
+                "estimated_capacity_bytes_per_sec": self._fmt_float(capacity_bps),
+                "estimated_capacity_mbps": self._fmt_float(capacity_mbps),
+                "max_frame_size_bytes": self._fmt_float(max_frame_size),
+                "rgb_bufferedAmount": int(self.data_channel_rgb.bufferedAmount) if self.data_channel_rgb else "",
+                "depth_bufferedAmount": int(self.data_channel_depth.bufferedAmount) if self.data_channel_depth else "",
+            })
+            self.capacity_file.flush()
 
     def start_trace(self):
         """
@@ -245,6 +505,64 @@ class Sender():
         chunks      = enc.encode(data_shards)  # length n_total
         return chunks, chunk_len
 
+    def _send_data_packet(self, dc, *, stream_name, frame_type, fid, gop_id, qp,
+                          chunk_idx, num_chunks, k_data, total_size, shard,
+                          sender_idle_boundary=False):
+        send_ts = time.perf_counter()
+        sender_grace = 0.0
+        if sender_idle_boundary and self.last_packet_send_ts is not None:
+            sender_grace = max(0.0, send_ts - self.last_packet_send_ts)
+
+        seq_id = self.next_packet_seq
+        self.next_packet_seq += 1
+        self.last_sent_sequence = seq_id
+
+        hdr = struct.pack(
+            FMT_DESC, MSG_DESC, int(frame_type),
+            int(fid), int(gop_id), int(qp),
+            int(chunk_idx), int(num_chunks), int(k_data), int(total_size),
+            int(seq_id), float(send_ts), float(sender_grace)
+        )
+        packet = hdr + shard
+        dc.send(packet)
+        self.last_packet_send_ts = send_ts
+        self.outstanding_packets[seq_id] = len(packet)
+        self.diagnostics.packet_sent(seq_id, send_ts)
+        return True, len(packet)
+
+    def _send_probe_packet(self, dc, *, burst_id, packet_idx, packets_in_burst,
+                           packet_size, sender_grace=0.0):
+        seq_id = self.next_packet_seq
+        self.next_packet_seq += 1
+        self.last_sent_sequence = seq_id
+
+        payload_len = max(0, int(packet_size) - SZ_PROBE)
+        hdr = struct.pack(
+            FMT_PROBE, MSG_PROBE, int(seq_id), int(burst_id), int(packet_idx),
+            int(packets_in_burst), float(max(0.0, sender_grace))
+        )
+        packet = hdr + (b"\x00" * payload_len)
+        dc.send(packet)
+        self.outstanding_packets[seq_id] = len(packet)
+        self.diagnostics.packet_sent(seq_id, time.perf_counter())
+        return seq_id, len(packet)
+
+    def _send_paced_probe_packet(self, dc, *, payload_size, packet_index,
+                                 sender_grace=0.0):
+        seq_id = self.next_packet_seq
+        self.next_packet_seq += 1
+        self.last_sent_sequence = seq_id
+
+        hdr = struct.pack(
+            FMT_PROBE, MSG_PROBE, int(seq_id), 0, int(packet_index),
+            0, float(max(0.0, sender_grace))
+        )
+        packet = hdr + (b"\x00" * max(0, int(payload_size)))
+        dc.send(packet)
+        self.outstanding_packets[seq_id] = len(packet)
+        self.diagnostics.packet_sent(seq_id, time.perf_counter())
+        return seq_id, len(packet)
+
     # ────────────────────────────────────────────────────────────────────────
     # Channel warm-up
     # ────────────────────────────────────────────────────────────────────────
@@ -263,6 +581,144 @@ class Sender():
         while time.perf_counter() < t_end:
             dc.send(zero_buf)
             await asyncio.sleep(interval)
+
+    async def send_validation_packet_trains(self):
+        """
+        Validation-only packet train. This probes the passive estimator through
+        the same WebRTC DataChannel without changing normal ReVo video behavior.
+        """
+        packet_size = int(self.args.validation_train_packet_size)
+        packets_per_burst = int(self.args.validation_train_packets)
+        interval_s = float(self.args.validation_train_interval)
+        duration_s = float(self.args.validation_train_duration)
+        hard_cap = max(BUFFERED_WATERMARK_HARD, packet_size * packets_per_burst * 2)
+
+        logging.info(
+            "[ValidationTrain] duration=%.1fs packet_size=%d packets_per_burst=%d interval=%.3fs",
+            duration_s, packet_size, packets_per_burst, interval_s
+        )
+        start = time.perf_counter()
+        next_burst_t = start
+        burst_id = 0
+        while time.perf_counter() - start < duration_s:
+            now = time.perf_counter()
+            if now < next_burst_t:
+                await asyncio.sleep(min(0.01, next_burst_t - now))
+                continue
+
+            sender_grace = 0.0
+            if self.last_packet_send_ts is not None:
+                sender_grace = max(0.0, now - self.last_packet_send_ts)
+            burst_id += 1
+            for packet_idx in range(packets_per_burst):
+                while self.data_channel_rgb.bufferedAmount > hard_cap:
+                    await asyncio.sleep(0.001)
+                grace = sender_grace if packet_idx == 0 else 0.0
+                self._send_probe_packet(
+                    self.data_channel_rgb,
+                    burst_id=burst_id,
+                    packet_idx=packet_idx,
+                    packets_in_burst=packets_per_burst,
+                    packet_size=packet_size,
+                    sender_grace=grace,
+                )
+                self.last_packet_send_ts = time.perf_counter()
+
+            next_burst_t += interval_s
+
+        logging.info("[ValidationTrain] completed %d bursts", burst_id)
+
+    async def send_validation_paced_probe(self):
+        """
+        Validation-only paced probe. Packets are ACKed by the receiver estimator
+        path and never enter RGB/depth frame assembly.
+        """
+        dc = self.data_channel_rgb
+        duration_s = float(self.args.validation_paced_duration)
+        payload_size = int(self.args.validation_paced_payload_size)
+        bitrate_mbps = float(self.args.validation_paced_bitrate_mbps)
+        soft_limit = int(self.args.validation_paced_soft_buffer_limit)
+        pause_s = float(self.args.validation_paced_backpressure_sleep)
+        bitrate_bps = bitrate_mbps * 1_000_000.0
+        packet_interval = (payload_size * 8.0) / bitrate_bps
+
+        logging.info(
+            "[PacedProbe] duration=%.3fs offered=%.3f Mbps payload=%dB interval=%.9fs soft_buffer=%dB",
+            duration_s, bitrate_mbps, payload_size, packet_interval, soft_limit
+        )
+        start = time.perf_counter()
+        end_time = start + duration_s
+        next_deadline = start
+        last_send_ts = None
+        cumulative_bytes = 0
+        sent_packets = 0
+        pause_events = 0
+        missed_deadlines = 0
+        max_buffered = 0
+
+        while time.perf_counter() < end_time:
+            if dc.readyState != "open":
+                logging.warning("[PacedProbe] DataChannel closed before duration completed")
+                break
+
+            now = time.perf_counter()
+            if now < next_deadline:
+                await asyncio.sleep(min(0.005, next_deadline - now))
+                continue
+
+            buffered = int(dc.bufferedAmount)
+            max_buffered = max(max_buffered, buffered)
+            lateness = max(0.0, now - next_deadline)
+            if lateness > packet_interval:
+                missed_deadlines += 1
+
+            if buffered > soft_limit:
+                pause_events += 1
+                self._log_probe_sender(
+                    timestamp=now, seq_id=None, payload_bytes=payload_size,
+                    bitrate_mbps=bitrate_mbps, packet_interval=packet_interval,
+                    actual_interval=None if last_send_ts is None else now - last_send_ts,
+                    lateness=lateness, buffered_amount=buffered, sent=False,
+                    paused=True, cumulative_bytes=cumulative_bytes,
+                )
+                await asyncio.sleep(pause_s)
+                # Keep schedule deadline-based, but avoid replaying a huge backlog
+                # after an intentional validation-only backpressure pause.
+                next_deadline = max(next_deadline + packet_interval, time.perf_counter())
+                await asyncio.sleep(0)
+                continue
+
+            send_start = time.perf_counter()
+            actual_interval = None if last_send_ts is None else send_start - last_send_ts
+            seq_id, packet_len = self._send_paced_probe_packet(
+                dc,
+                payload_size=payload_size,
+                packet_index=sent_packets,
+                # Deadline pacing keeps this train continuously offered.  Its
+                # ordinary inter-send interval is not sender-created idle time.
+                sender_grace=0.0,
+            )
+            last_send_ts = time.perf_counter()
+            self.last_packet_send_ts = last_send_ts
+            sent_packets += 1
+            cumulative_bytes += packet_len
+            self._log_probe_sender(
+                timestamp=last_send_ts, seq_id=seq_id, payload_bytes=payload_size,
+                bitrate_mbps=bitrate_mbps, packet_interval=packet_interval,
+                actual_interval=actual_interval, lateness=lateness,
+                buffered_amount=buffered, sent=True, paused=False,
+                cumulative_bytes=cumulative_bytes,
+            )
+            next_deadline += packet_interval
+            await asyncio.sleep(0)
+
+        elapsed = time.perf_counter() - start
+        offered_mbps = (cumulative_bytes * 8.0 / elapsed / 1_000_000.0) if elapsed > 0 else 0.0
+        logging.info(
+            "[PacedProbe] completed elapsed=%.3fs packets=%d bytes=%d offered=%.3f Mbps pauses=%d missed_deadlines=%d max_buffered=%d channel=%s",
+            elapsed, sent_packets, cumulative_bytes, offered_mbps, pause_events,
+            missed_deadlines, max_buffered, dc.readyState
+        )
 
     # ────────────────────────────────────────────────────────────────────────
     # Main streaming loop
@@ -348,11 +804,38 @@ class Sender():
 
                     # ── Back-pressure check ──────────────────────────────────
                     # Drop the frame if either channel's send buffer is full.
-                    if self.data_channel_rgb.bufferedAmount > BUFFERED_WATERMARK_HARD:
+                    buffered_rgb_before = int(self.data_channel_rgb.bufferedAmount)
+                    buffered_depth_before = int(self.data_channel_depth.bufferedAmount)
+                    if is_key:
+                        num_chunks_log = max(1, (len(payload) + self.chunk_size - 1) // self.chunk_size)
+                        num_chunks_log = num_chunks_log + (num_chunks_log + 1) // 2
+                        num_chunks_depth_log = max(1, (len(payload_depth) + self.chunk_size_depth - 1) // self.chunk_size_depth)
+                        num_chunks_depth_log = num_chunks_depth_log + (num_chunks_depth_log + 1) // 2
+                    else:
+                        num_chunks_log = max(1, (len(payload) + self.chunk_size - 1) // self.chunk_size)
+                        num_chunks_depth_log = max(1, (len(payload_depth) + self.chunk_size_depth - 1) // self.chunk_size_depth)
+
+                    drop_reason = ""
+                    if buffered_rgb_before > BUFFERED_WATERMARK_HARD:
                         logging.warning(f"[Sender] RGB buffer full — dropping frame {out_fid}")
-                        break
-                    if self.data_channel_depth.bufferedAmount > BUFFERED_WATERMARK_HARD:
+                        drop_reason = "rgb_buffer_full"
+                    elif buffered_depth_before > BUFFERED_WATERMARK_HARD:
                         logging.warning(f"[Sender] Depth buffer full — dropping frame {out_fid}")
+                        drop_reason = "depth_buffer_full"
+
+                    if drop_reason:
+                        self._log_frame_measurement(
+                            frame_id=out_fid, stream="rgb", is_key=is_key,
+                            encoded_size=len(payload), num_chunks=num_chunks_log,
+                            chunk_size=self.chunk_size, buffered_before=buffered_rgb_before,
+                            sent=False, drop_reason=drop_reason
+                        )
+                        self._log_frame_measurement(
+                            frame_id=out_fid, stream="depth", is_key=is_key,
+                            encoded_size=len(payload_depth), num_chunks=num_chunks_depth_log,
+                            chunk_size=self.chunk_size_depth, buffered_before=buffered_depth_before,
+                            sent=False, drop_reason=drop_reason
+                        )
                         break
 
                     # ── Chunk / shard preparation ────────────────────────────
@@ -387,22 +870,11 @@ class Sender():
                     idx             = 0  # global packet counter for pacing
 
                     # Stash first P-frame chunk for retransmission after the loop
-                    first_rgb_packet   = None
-                    first_depth_packet = None
-
-                    def _build_rgb_hdr():
-                        return struct.pack(
-                            FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
-                            int(out_fid), int(gop_id), int(qp),
-                            int(chunk_idx), int(num_chunks), int(k_data), int(len(payload))
-                        )
-
-                    def _build_depth_hdr():
-                        return struct.pack(
-                            FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
-                            int(out_fid), int(gop_id), int(qp_depth),
-                            int(chunk_idx_depth), int(num_chunks_depth), int(k_data_depth), int(len(payload_depth))
-                        )
+                    first_rgb_shard   = None
+                    first_depth_shard = None
+                    frame_idle_boundary = (
+                        buffered_rgb_before == 0 and buffered_depth_before == 0
+                    )
 
                     async def _pace():
                         """Sleep until the next pacing slot."""
@@ -414,103 +886,152 @@ class Sender():
                     # Phase 1: interleaved RGB + depth (while both streams still have chunks)
                     while chunk_idx < num_chunks and chunk_idx_depth < num_chunks_depth:
                         # RGB chunk
-                        hdr    = _build_rgb_hdr()
                         shard  = chunks[chunk_idx] if is_key else payload[cursor:cursor + self.chunk_size]
                         if not is_key:
                             cursor += len(shard)
-                        packet = hdr + shard
                         if chunk_idx == 0 and not is_key:
-                            first_rgb_packet = packet
-                        self.data_channel_rgb.send(packet)
-                        logging.debug(f"rgb  frame {out_fid} chunk {chunk_idx} sent")
-                        self.reliable_bytes_meta += len(hdr)
-                        if is_key:
-                            self.i_bytes_sent += len(packet)
-                            if chunk_idx >= k_data:
-                                self.i_bytes_parity  += len(packet)
+                            first_rgb_shard = shard
+                        sent, packet_len = self._send_data_packet(
+                            self.data_channel_rgb,
+                            stream_name="rgb", frame_type=FRAME_TYPE_RGB,
+                            fid=out_fid, gop_id=gop_id, qp=qp,
+                            chunk_idx=chunk_idx, num_chunks=num_chunks,
+                            k_data=k_data, total_size=len(payload), shard=shard,
+                            sender_idle_boundary=(frame_idle_boundary and chunk_idx == 0),
+                        )
+                        if sent:
+                            logging.debug(f"rgb  frame {out_fid} chunk {chunk_idx} sent")
+                            self.reliable_bytes_meta += SZ_DESC
+                            if is_key:
+                                self.i_bytes_sent += packet_len
+                                if chunk_idx >= k_data:
+                                    self.i_bytes_parity  += packet_len
+                                else:
+                                    self.i_bytes_payload += packet_len
                             else:
-                                self.i_bytes_payload += len(packet)
-                        else:
-                            self.p_bytes_sent += len(packet)
-                        self.total_bytes_sent += len(packet)
+                                self.p_bytes_sent += packet_len
+                            self.total_bytes_sent += packet_len
                         chunk_idx += 1
                         await _pace()
 
                         # Depth chunk
-                        hdr_d   = _build_depth_hdr()
                         shard_d = chunks_depth[chunk_idx_depth] if is_key else payload_depth[cursor_depth:cursor_depth + self.chunk_size_depth]
                         if not is_key:
                             cursor_depth += len(shard_d)
-                        packet_d = hdr_d + shard_d
                         if chunk_idx_depth == 0 and not is_key:
-                            first_depth_packet = packet_d
-                        self.data_channel_depth.send(packet_d)
-                        logging.debug(f"depth frame {out_fid} chunk {chunk_idx_depth} sent")
-                        self.reliable_bytes_meta_depth += len(hdr_d)
-                        if is_key:
-                            self.i_bytes_depth_sent += len(packet_d)
-                            if chunk_idx_depth >= k_data_depth:
-                                self.i_bytes_depth_parity  += len(packet_d)
+                            first_depth_shard = shard_d
+                        sent_depth, packet_len = self._send_data_packet(
+                            self.data_channel_depth,
+                            stream_name="depth", frame_type=FRAME_TYPE_DEPTH,
+                            fid=out_fid, gop_id=gop_id, qp=qp_depth,
+                            chunk_idx=chunk_idx_depth, num_chunks=num_chunks_depth,
+                            k_data=k_data_depth, total_size=len(payload_depth), shard=shard_d
+                        )
+                        if sent_depth:
+                            logging.debug(f"depth frame {out_fid} chunk {chunk_idx_depth} sent")
+                            self.reliable_bytes_meta_depth += SZ_DESC
+                            if is_key:
+                                self.i_bytes_depth_sent += packet_len
+                                if chunk_idx_depth >= k_data_depth:
+                                    self.i_bytes_depth_parity  += packet_len
+                                else:
+                                    self.i_bytes_depth_payload += packet_len
                             else:
-                                self.i_bytes_depth_payload += len(packet_d)
-                        else:
-                            self.p_bytes_depth_sent += len(packet_d)
-                        self.total_bytes_depth_sent += len(packet_d)
+                                self.p_bytes_depth_sent += packet_len
+                            self.total_bytes_depth_sent += packet_len
                         chunk_idx_depth += 1
                         await _pace()
 
                     # Phase 2: drain any remaining RGB chunks (if RGB had more than depth)
                     while chunk_idx < num_chunks:
-                        hdr   = _build_rgb_hdr()
                         shard = chunks[chunk_idx] if is_key else payload[cursor:cursor + self.chunk_size]
                         if not is_key:
                             cursor += len(shard)
-                        packet = hdr + shard
-                        self.data_channel_rgb.send(packet)
-                        self.reliable_bytes_meta += len(hdr)
-                        if is_key:
-                            self.i_bytes_sent += len(packet)
-                            if chunk_idx >= k_data:
-                                self.i_bytes_parity  += len(packet)
+                        sent, packet_len = self._send_data_packet(
+                            self.data_channel_rgb,
+                            stream_name="rgb", frame_type=FRAME_TYPE_RGB,
+                            fid=out_fid, gop_id=gop_id, qp=qp,
+                            chunk_idx=chunk_idx, num_chunks=num_chunks,
+                            k_data=k_data, total_size=len(payload), shard=shard
+                        )
+                        if sent:
+                            self.reliable_bytes_meta += SZ_DESC
+                            if is_key:
+                                self.i_bytes_sent += packet_len
+                                if chunk_idx >= k_data:
+                                    self.i_bytes_parity  += packet_len
+                                else:
+                                    self.i_bytes_payload += packet_len
                             else:
-                                self.i_bytes_payload += len(packet)
-                        else:
-                            self.p_bytes_sent += len(packet)
-                        self.total_bytes_sent += len(packet)
+                                self.p_bytes_sent += packet_len
+                            self.total_bytes_sent += packet_len
                         chunk_idx += 1
                         await _pace()
 
                     # Phase 3: drain any remaining depth chunks
                     while chunk_idx_depth < num_chunks_depth:
-                        hdr_d   = _build_depth_hdr()
                         shard_d = chunks_depth[chunk_idx_depth] if is_key else payload_depth[cursor_depth:cursor_depth + self.chunk_size_depth]
                         if not is_key:
                             cursor_depth += len(shard_d)
-                        packet_d = hdr_d + shard_d
-                        self.data_channel_depth.send(packet_d)
-                        self.reliable_bytes_meta_depth += len(hdr_d)
-                        if is_key:
-                            self.i_bytes_depth_sent += len(packet_d)
-                            if chunk_idx_depth >= k_data_depth:
-                                self.i_bytes_depth_parity  += len(packet_d)
+                        sent_depth, packet_len = self._send_data_packet(
+                            self.data_channel_depth,
+                            stream_name="depth", frame_type=FRAME_TYPE_DEPTH,
+                            fid=out_fid, gop_id=gop_id, qp=qp_depth,
+                            chunk_idx=chunk_idx_depth, num_chunks=num_chunks_depth,
+                            k_data=k_data_depth, total_size=len(payload_depth), shard=shard_d
+                        )
+                        if sent_depth:
+                            self.reliable_bytes_meta_depth += SZ_DESC
+                            if is_key:
+                                self.i_bytes_depth_sent += packet_len
+                                if chunk_idx_depth >= k_data_depth:
+                                    self.i_bytes_depth_parity  += packet_len
+                                else:
+                                    self.i_bytes_depth_payload += packet_len
                             else:
-                                self.i_bytes_depth_payload += len(packet_d)
-                        else:
-                            self.p_bytes_depth_sent += len(packet_d)
-                        self.total_bytes_depth_sent += len(packet_d)
+                                self.p_bytes_depth_sent += packet_len
+                            self.total_bytes_depth_sent += packet_len
                         chunk_idx_depth += 1
                         await _pace()
 
                     # Phase 4 (P-frames only): retransmit chunk 0 of both streams.
                     # The first chunk carries the slice header that the codec needs
                     # to begin decoding, so one extra copy improves delivery odds.
-                    if not is_key and first_rgb_packet and first_depth_packet:
-                        self.data_channel_rgb.send(first_rgb_packet)
-                        self.data_channel_depth.send(first_depth_packet)
-                        self.p_bytes_sent        += len(first_rgb_packet)
-                        self.p_bytes_depth_sent  += len(first_depth_packet)
-                        self.total_bytes_sent     += len(first_rgb_packet)
-                        self.total_bytes_depth_sent += len(first_depth_packet)
+                    if not is_key and first_rgb_shard and first_depth_shard:
+                        sent, packet_len = self._send_data_packet(
+                            self.data_channel_rgb,
+                            stream_name="rgb", frame_type=FRAME_TYPE_RGB,
+                            fid=out_fid, gop_id=gop_id, qp=qp,
+                            chunk_idx=0, num_chunks=num_chunks,
+                            k_data=k_data, total_size=len(payload), shard=first_rgb_shard
+                        )
+                        if sent:
+                            self.p_bytes_sent        += packet_len
+                            self.total_bytes_sent     += packet_len
+                        sent_depth, packet_len = self._send_data_packet(
+                            self.data_channel_depth,
+                            stream_name="depth", frame_type=FRAME_TYPE_DEPTH,
+                            fid=out_fid, gop_id=gop_id, qp=qp_depth,
+                            chunk_idx=0, num_chunks=num_chunks_depth,
+                            k_data=k_data_depth, total_size=len(payload_depth), shard=first_depth_shard
+                        )
+                        if sent_depth:
+                            self.p_bytes_depth_sent  += packet_len
+                            self.total_bytes_depth_sent += packet_len
+
+                    t_send1 = time.perf_counter()
+                    self._log_frame_measurement(
+                        frame_id=out_fid, stream="rgb", is_key=is_key,
+                        encoded_size=len(payload), num_chunks=num_chunks,
+                        chunk_size=self.chunk_size, buffered_before=buffered_rgb_before,
+                        sent=True, send_start=t_send0, send_end=t_send1
+                    )
+                    self._log_frame_measurement(
+                        frame_id=out_fid, stream="depth", is_key=is_key,
+                        encoded_size=len(payload_depth), num_chunks=num_chunks_depth,
+                        chunk_size=self.chunk_size_depth, buffered_before=buffered_depth_before,
+                        sent=True, send_start=t_send0, send_end=t_send1
+                    )
 
                     self.sent_frames       += 1
                     self.sent_frames_depth += 1
@@ -528,13 +1049,27 @@ class Sender():
                     out_fid = out["frame_id"]
                     is_key  = out["is_key"]
                     qp      = out["qp"]
-                    hdr = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
-                                      int(out_fid), int(gop_id), int(qp), 0, 1, 1, int(len(payload)))
-                    self.data_channel_rgb.send(hdr + payload)
-                    self.i_bytes_sent        += len(hdr) + len(payload)
-                    self.total_bytes_sent    += len(hdr) + len(payload)
-                    self.reliable_bytes_meta += len(hdr)
-                    self.sent_frames         += 1
+                    t_flush0 = time.perf_counter()
+                    buffered_rgb_before = int(self.data_channel_rgb.bufferedAmount)
+                    sent, packet_len = self._send_data_packet(
+                        self.data_channel_rgb,
+                        stream_name="rgb", frame_type=FRAME_TYPE_RGB,
+                        fid=out_fid, gop_id=gop_id, qp=qp,
+                        chunk_idx=0, num_chunks=1, k_data=1,
+                        total_size=len(payload), shard=payload
+                    )
+                    t_flush1 = time.perf_counter()
+                    if sent:
+                        self.i_bytes_sent        += packet_len
+                        self.total_bytes_sent    += packet_len
+                        self.reliable_bytes_meta += SZ_DESC
+                        self.sent_frames         += 1
+                    self._log_frame_measurement(
+                        frame_id=out_fid, stream="rgb", is_key=is_key,
+                        encoded_size=len(payload), num_chunks=1,
+                        chunk_size=len(payload), buffered_before=buffered_rgb_before,
+                        sent=True, send_start=t_flush0, send_end=t_flush1
+                    )
                     logging.info("Sent frame %04d (%s, %d B RGB) [flush]",
                                  out_fid, "I" if is_key else "P", len(payload))
 
@@ -543,13 +1078,27 @@ class Sender():
                     out_fid_d     = out_d["frame_id"]
                     is_key        = out_d["is_key"]
                     qp_depth      = out_d["qp"]
-                    hdr_d = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
-                                        int(out_fid), int(gop_id), int(qp_depth), 0, 1, 1, int(len(payload_depth)))
-                    self.data_channel_depth.send(hdr_d + payload_depth)
-                    self.i_bytes_depth_sent       += len(hdr_d) + len(payload_depth)
-                    self.total_bytes_depth_sent   += len(hdr_d) + len(payload_depth)
-                    self.reliable_bytes_meta_depth += len(hdr_d)
-                    self.sent_frames_depth += 1
+                    t_flush0 = time.perf_counter()
+                    buffered_depth_before = int(self.data_channel_depth.bufferedAmount)
+                    sent_depth, packet_len = self._send_data_packet(
+                        self.data_channel_depth,
+                        stream_name="depth", frame_type=FRAME_TYPE_DEPTH,
+                        fid=out_fid_d, gop_id=gop_id, qp=qp_depth,
+                        chunk_idx=0, num_chunks=1, k_data=1,
+                        total_size=len(payload_depth), shard=payload_depth
+                    )
+                    t_flush1 = time.perf_counter()
+                    if sent_depth:
+                        self.i_bytes_depth_sent       += packet_len
+                        self.total_bytes_depth_sent   += packet_len
+                        self.reliable_bytes_meta_depth += SZ_DESC
+                        self.sent_frames_depth += 1
+                    self._log_frame_measurement(
+                        frame_id=out_fid_d, stream="depth", is_key=is_key,
+                        encoded_size=len(payload_depth), num_chunks=1,
+                        chunk_size=len(payload_depth), buffered_before=buffered_depth_before,
+                        sent=True, send_start=t_flush0, send_end=t_flush1
+                    )
                     logging.info("Sent frame %04d (%s, %d B depth) [flush]",
                                  out_fid_d, "I" if is_key else "P", len(payload_depth))
 
@@ -574,6 +1123,14 @@ class Sender():
         # real-time video, so we skip retransmission at the SCTP layer entirely.
         self.data_channel_rgb   = self.pc.createDataChannel("rgb_payload",   ordered=False, maxRetransmits=0)
         self.data_channel_depth = self.pc.createDataChannel("depth_payload", ordered=False, maxRetransmits=0)
+        self.diagnostics.start(lambda: {
+            "rgb_buffered_amount": int(self.data_channel_rgb.bufferedAmount),
+            "depth_buffered_amount": int(self.data_channel_depth.bufferedAmount),
+            "outstanding_packets": max(0, self.last_sent_sequence - self.last_acknowledged_sequence),
+            "last_sent_sequence": self.last_sent_sequence,
+            "connection_state": self.pc.connectionState,
+            "ice_state": self.pc.iceConnectionState,
+        })
 
         self.i_open = asyncio.Event()   # set when rgb_payload channel is open
         self.p_open = asyncio.Event()   # set when depth_payload channel is open
@@ -581,6 +1138,11 @@ class Sender():
         @self.pc.on("iceconnectionstatechange")
         async def on_state_change():
             logging.warning(f"[Sender] ICE state: {self.pc.iceConnectionState}")
+            if (self.pc.iceConnectionState == "completed"
+                    and self.ice_consent_timeout_s is not None
+                    and not self._ice_consent_timeout_applied):
+                apply_ice_consent_timeout(self.ice_consent_timeout_s, "Sender")
+                self._ice_consent_timeout_applied = True
 
         @self.data_channel_rgb.on("open")
         def on_rgb_open():
@@ -589,10 +1151,18 @@ class Sender():
             # Warm up the path before real video data arrives
             asyncio.create_task(self.send_garbage(self.data_channel_rgb, duration_s=1.0, pps=200, size=1200))
 
+        @self.data_channel_rgb.on("message")
+        def on_rgb_message(msg):
+            self._handle_feedback_message(msg)
+
         @self.data_channel_depth.on("open")
         def on_depth_open():
             logging.info("depth_payload channel open")
             self.p_open.set()
+
+        @self.data_channel_depth.on("message")
+        def on_depth_message(msg):
+            self._handle_feedback_message(msg)
 
         @self.data_channel_rgb.on("close")
         def on_rgb_close():
@@ -637,7 +1207,12 @@ class Sender():
                     logging.info("[Sender] Both channels open — starting stream in 2 s")
                     await asyncio.sleep(2)
 
-                    await self.stream_video()
+                    if self.args.validation_paced_probe_only:
+                        await self.send_validation_paced_probe()
+                    elif self.args.validation_train_only:
+                        await self.send_validation_packet_trains()
+                    else:
+                        await self.stream_video()
                     await asyncio.sleep(0.5)  # let last packets drain before closing
 
                     # Notify the receiver that streaming is complete
@@ -673,6 +1248,10 @@ class Sender():
         finally:
             # Always clean up TC rules even on crash / KeyboardInterrupt
             self.stop_trace()
+            self._close_measurement_log()
+            self._close_capacity_log()
+            self._close_probe_sender_log()
+            await self.diagnostics.stop()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -693,6 +1272,42 @@ if __name__ == "__main__":
     p.add_argument("--trace_path", default=None,          help="Path to the network trace CSV file")
     p.add_argument("--interface",  default="enp130s0",    help="Network interface for tc rules (e.g. enp130s0)")
     p.add_argument("--tc_script",  default="run_loss_trace.py", help="Path to the TC control Python script")
+    p.add_argument("--measurement_csv", default="output/sender_frame_measurements.csv",
+                   help="CSV path for passive per-frame sender measurements")
+    p.add_argument("--capacity_csv", default="output/week1_estimator/capacity_estimator.csv",
+                   help="CSV path for passive capacity-estimator feedback logs")
+    p.add_argument("--probe_sender_csv", default="",
+                   help="CSV path for validation-only probe sender logs")
+    p.add_argument("--capacity_delay_target", type=float, default=0.1,
+                   help="Salsify-style delay target in seconds for passive max-frame-size logging")
+    p.add_argument("--diagnostic_csv", default="",
+                   help="Validation only: one-second sender event-loop/feedback diagnostics")
+    p.add_argument("--diagnostic_ice", action="store_true",
+                   help="Validation only: timestamp aioice STUN consent traffic")
+    p.add_argument("--ice_consent_timeout_s", type=float, default=None,
+                   help="Validation only: aioice consent timeout applied after ICE completes")
+    p.add_argument("--validation_train_only", action="store_true",
+                   help="Validation only: send synthetic packet trains instead of ReVo video frames")
+    p.add_argument("--validation_train_duration", type=float, default=60.0,
+                   help="Validation packet-train duration in seconds")
+    p.add_argument("--validation_train_packet_size", type=int, default=1200,
+                   help="Validation packet-train packet size in bytes, including probe header")
+    p.add_argument("--validation_train_packets", type=int, default=320,
+                   help="Validation packet-train packets per burst")
+    p.add_argument("--validation_train_interval", type=float, default=0.25,
+                   help="Validation packet-train burst interval in seconds")
+    p.add_argument("--validation_paced_probe_only", action="store_true",
+                   help="Validation only: send evenly paced probe packets instead of ReVo video frames")
+    p.add_argument("--validation_paced_duration", type=float, default=60.0,
+                   help="Validation paced-probe duration in seconds")
+    p.add_argument("--validation_paced_bitrate_mbps", type=float, default=9.0,
+                   help="Validation paced-probe target payload bitrate in Mbps")
+    p.add_argument("--validation_paced_payload_size", type=int, default=1024,
+                   help="Validation paced-probe payload bytes, not including probe header")
+    p.add_argument("--validation_paced_soft_buffer_limit", type=int, default=32768,
+                   help="Validation-only soft DataChannel bufferedAmount limit before pausing probes")
+    p.add_argument("--validation_paced_backpressure_sleep", type=float, default=0.002,
+                   help="Validation-only sleep when probe bufferedAmount exceeds the soft limit")
 
     args = p.parse_args()
     s    = Sender(args)

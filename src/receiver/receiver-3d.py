@@ -46,6 +46,14 @@ import struct
 import threading
 from zfec import Decoder
 import os
+from capacity_estimator import ArrivalCapacityEstimator
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from webrtc_diagnostics import (
+    WebRTCDiagnostics,
+    apply_ice_consent_timeout,
+    enable_ice_debug_logging,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -61,6 +69,8 @@ RESET = '\033[0m'
 MSG_INIT  = 1   # stream parameters (width, height, fps, chunk sizes)
 MSG_DESC  = 2   # per-chunk descriptor (frame id, chunk index, FEC params, …)
 MSG_CHUNK = 3   # (unused; payload is appended directly after MSG_DESC)
+MSG_PROBE = 5   # validation-only packet-train probe
+MSG_CAPACITY_FEEDBACK = 6
 
 # ---------------------------------------------------------------------------
 # Binary wire formats (little-endian)
@@ -70,11 +80,14 @@ MSG_CHUNK = 3   # (unused; payload is appended directly after MSG_DESC)
 #
 # DESC  – type:u8 | frame_type:u8 | frame_id:u32 | gop_id:u32
 #           | qp:u8 | chunk_idx:u16 | num_chunks(n):u16
-#           | k_data:u16 | total_size:u32
+#           | k_data:u16 | total_size:u32 | seq_id:u64
+#           | sender_send_ts:f64 | sender_grace_period:f64
 #         (raw shard bytes follow immediately after the fixed header)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIQdd"
+FMT_PROBE = "<BQIIHd"
+FMT_CAPACITY_FEEDBACK = "<BQIddddd"
 
 # Frame-type tags that travel in the DESC header
 FRAME_TYPE_RGB   = 3
@@ -82,6 +95,8 @@ FRAME_TYPE_DEPTH = 4
 
 SZ_INIT = struct.calcsize(FMT_INIT)
 SZ_DESC = struct.calcsize(FMT_DESC)
+SZ_PROBE = struct.calcsize(FMT_PROBE)
+SZ_CAPACITY_FEEDBACK = struct.calcsize(FMT_CAPACITY_FEEDBACK)
 
 # Hard cap on in-flight frame slots to prevent unbounded memory growth
 MAX_FRAME_CHUNK_LIMIT = 2000
@@ -115,6 +130,8 @@ class Receiver():
         self.signalling_server = f"ws://{args.server_ip}:8080/ws/demo"
         self.cfg               = None
         self.pc                = None
+        self.ice_consent_timeout_s = args.ice_consent_timeout_s
+        self._ice_consent_timeout_applied = False
 
         # ── Stream parameters (overwritten by INIT message) ─────────────────
         self.pic_height        = 512
@@ -221,6 +238,11 @@ class Receiver():
         self.display_thread = None
 
         self._last_chunk_gc = time.perf_counter()
+        self.capacity_estimator = ArrivalCapacityEstimator(alpha=args.estimator_alpha)
+        if args.diagnostic_ice:
+            enable_ice_debug_logging()
+        self.diagnostics = WebRTCDiagnostics(args.diagnostic_csv, "receiver")
+        self.diagnostic_channels = {}
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -272,6 +294,33 @@ class Receiver():
         deadline(fid) = clock_t0 + (fid + 1) * T
         """
         return self.clock_t0 + (fid + 1) * self.T
+
+    def _send_capacity_feedback(self, channel, *, seq_id, packet_size,
+                                receiver_ts, sender_grace_period):
+        sample = self.capacity_estimator.observe(
+            receiver_ts,
+            sender_grace_period,
+            sequence_id=seq_id,
+            packet_size_bytes=packet_size,
+        )
+        def encode_optional(value):
+            return -1.0 if value is None else float(value)
+        feedback = struct.pack(
+            FMT_CAPACITY_FEEDBACK,
+            MSG_CAPACITY_FEEDBACK,
+            int(seq_id),
+            int(packet_size),
+            float(receiver_ts),
+            encode_optional(sample["raw_interarrival"]),
+            float(sample["sender_grace_period"]),
+            encode_optional(sample["corrected_interarrival"]),
+            encode_optional(sample["ewma_interarrival"]),
+        )
+        try:
+            channel.send(feedback)
+            self.diagnostics.feedback_event(seq_id, receiver_ts)
+        except Exception:
+            logging.debug("[Receiver] capacity feedback send failed", exc_info=True)
 
     # ────────────────────────────────────────────────────────────────────────
     # Best-effort payload builder (P-frames with missing chunks)
@@ -665,6 +714,16 @@ class Receiver():
         """
         self.cfg = RTCConfiguration([RTCIceServer(urls=[self.stun_url])])
         self.pc  = RTCPeerConnection(configuration=self.cfg)
+        self.diagnostics.start(lambda: {
+            "rgb_buffered_amount": int(self.diagnostic_channels["rgb_payload"].bufferedAmount)
+            if "rgb_payload" in self.diagnostic_channels else "",
+            "depth_buffered_amount": int(self.diagnostic_channels["depth_payload"].bufferedAmount)
+            if "depth_payload" in self.diagnostic_channels else "",
+            "outstanding_packets": "",
+            "last_sent_sequence": "",
+            "connection_state": self.pc.connectionState,
+            "ice_state": self.pc.iceConnectionState,
+        })
 
         # Start background worker threads
         self.stop_threads.clear()
@@ -677,13 +736,24 @@ class Receiver():
         async def on_state_change():
             logging.info(f"[Receiver] Connection state: {self.pc.connectionState}")
 
+        @self.pc.on("iceconnectionstatechange")
+        async def on_ice_state_change():
+            logging.info(f"[Receiver] ICE state: {self.pc.iceConnectionState}")
+            if (self.pc.iceConnectionState == "completed"
+                    and self.ice_consent_timeout_s is not None
+                    and not self._ice_consent_timeout_applied):
+                apply_ice_consent_timeout(self.ice_consent_timeout_s, "Receiver")
+                self._ice_consent_timeout_applied = True
+
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             logging.info("Receiver: DataChannel %s created", channel.label)
+            self.diagnostic_channels[channel.label] = channel
 
             @channel.on("message")
             async def on_message(msg):
                 try:
+                    receiver_ts = time.perf_counter()
                     if isinstance(msg, str):
                         msg = msg.encode("utf-8")
 
@@ -704,11 +774,29 @@ class Receiver():
                         return
 
                     # ── DESC + shard payload ─────────────────────────────────
+                    if len(msg) >= SZ_PROBE and msg[0] == MSG_PROBE:
+                        (_mtype, seq_id, _burst_id, _packet_idx,
+                         _packets_in_burst, sender_grace_period) = struct.unpack(
+                            FMT_PROBE, msg[:SZ_PROBE]
+                        )
+                        self._send_capacity_feedback(
+                            channel,
+                            seq_id=int(seq_id),
+                            packet_size=len(msg),
+                            receiver_ts=receiver_ts,
+                            sender_grace_period=sender_grace_period,
+                        )
+                        await asyncio.sleep(0)
+                        return
+
                     if len(msg) < SZ_DESC:
                         return  # too short to be a valid DESC packet; discard
 
                     (mtype, frame_type, fid, gop_id, qp,
-                     chunk_idx, num_chunks, k_data, total_size) = struct.unpack(FMT_DESC, msg[:SZ_DESC])
+                     chunk_idx, num_chunks, k_data, total_size,
+                     seq_id, _sender_send_ts, sender_grace_period) = struct.unpack(
+                        FMT_DESC, msg[:SZ_DESC]
+                    )
 
                     if mtype != MSG_DESC:
                         return  # unexpected message type
@@ -722,6 +810,15 @@ class Receiver():
                     k_data     = int(k_data)
                     total_size = int(total_size)
                     frame_type = int(frame_type)
+                    seq_id     = int(seq_id)
+
+                    self._send_capacity_feedback(
+                        channel,
+                        seq_id=seq_id,
+                        packet_size=len(msg),
+                        receiver_ts=receiver_ts,
+                        sender_grace_period=sender_grace_period,
+                    )
 
                     with self.fc_cv:
                         # Discard stale P-frames that belong to an already-decoded (older) GOP
@@ -881,6 +978,7 @@ class Receiver():
                 if self.display_thread:
                     self.display_thread.join(timeout=1.0)
 
+                await self.diagnostics.stop()
                 cv2.destroyAllWindows()
                 logging.info("[Receiver] Graceful shutdown complete")
 
@@ -942,6 +1040,14 @@ if __name__ == "__main__":
     p.add_argument("--codec",     required=True,           default="h265",
                    choices=["dcvcrt", "h265", "h264"],
                    help="Video codec for both RGB and depth streams")
+    p.add_argument("--estimator_alpha", type=float, default=0.1,
+                   help="EWMA alpha for passive receiver inter-arrival estimator")
+    p.add_argument("--diagnostic_csv", default="",
+                   help="Validation only: one-second receiver event-loop/feedback diagnostics")
+    p.add_argument("--diagnostic_ice", action="store_true",
+                   help="Validation only: timestamp aioice STUN consent traffic")
+    p.add_argument("--ice_consent_timeout_s", type=float, default=None,
+                   help="Validation only: aioice consent timeout applied after ICE completes")
 
     args = p.parse_args()
     r    = Receiver(args)

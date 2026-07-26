@@ -23,16 +23,25 @@ import time
 import subprocess
 import sys
 import argparse
+import csv
 import os
 
-# One-way delay applied to all packets.  RTT column in the trace is ignored.
+# One-way delay applied to all packets. RTT column in the trace is ignored.
 FIXED_DELAY_MS = 40
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ReVo network trace player")
     parser.add_argument("--interface", default="enp130s0", help="Network interface (e.g. eth0)")
-    parser.add_argument("--trace",     required=True,      help="Path to the trace file")
+    parser.add_argument("--trace", required=True, help="Path to the trace file")
+    parser.add_argument("--ground_truth_csv", default=None,
+                        help="Optional CSV path for monotonic timestamps of applied tc updates")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Optional max replay duration in seconds")
+    parser.add_argument("--loss_override", type=float, default=None,
+                        help="Optional validation-only loss fraction override")
+    parser.add_argument("--delay_override_ms", type=float, default=None,
+                        help="Optional validation-only netem delay override in milliseconds")
     return parser.parse_args()
 
 
@@ -54,16 +63,19 @@ def setup_tc(interface: str):
     _run(f"tc qdisc  add dev {interface} parent 1:10 handle 10: netem delay 0ms loss 0%")
 
 
-def update_tc(interface: str, bandwidth_mbps: float, loss_ratio: float):
-    """
-    Apply one trace step: update bandwidth (HTB class) and loss+delay (netem).
-    loss_ratio is in [0, 1]; converted to percent for netem.
-    """
+def update_tc(interface: str, bandwidth_mbps: float, loss_ratio: float,
+              delay_ms=FIXED_DELAY_MS):
+    """Apply one trace step and return its absolute monotonic timestamp."""
     loss_pct = max(0.0, loss_ratio * 100.0)
     _run(f"tc class change dev {interface} parent 1: classid 1:10 htb rate {bandwidth_mbps}Mbit burst 150k")
-    _run(f"tc qdisc change dev {interface} parent 1:10 handle 10: netem delay {FIXED_DELAY_MS}ms loss {loss_pct}%")
-    sys.stdout.write(f"\r[trace] BW: {bandwidth_mbps:.1f} Mbps | Loss: {loss_pct:.1f}% | t={time.perf_counter():.2f}s")
+    _run(f"tc qdisc change dev {interface} parent 1:10 handle 10: netem delay {delay_ms}ms loss {loss_pct}%")
+    applied_ts = time.perf_counter()
+    sys.stdout.write(
+        f"\r[trace] BW: {bandwidth_mbps:.1f} Mbps | Loss: {loss_pct:.1f}% | "
+        f"Delay: {delay_ms:g} ms | t={applied_ts:.2f}s"
+    )
     sys.stdout.flush()
+    return applied_ts, loss_pct, delay_ms
 
 
 def cleanup_tc(interface: str):
@@ -89,18 +101,38 @@ def main():
         cleanup_tc(args.interface)
         return
 
-    # Total duration of one pass — used to offset timestamps on loop
     trace_duration = float(lines[-1].split()[0])
-    num_lines      = len(lines)
-    line_idx       = 0
-    loop_offset    = 0.0
-    start_time     = time.perf_counter()
+    num_lines = len(lines)
+    line_idx = 0
+    loop_offset = 0.0
+    start_time = time.perf_counter()
+    gt_file = None
+    gt_writer = None
 
     try:
-        while True:
-            current_idx = line_idx % num_lines
+        if args.ground_truth_csv:
+            os.makedirs(os.path.dirname(os.path.abspath(args.ground_truth_csv)), exist_ok=True)
+            gt_file = open(args.ground_truth_csv, "w", newline="")
+            gt_writer = csv.DictWriter(
+                gt_file,
+                fieldnames=[
+                    "monotonic_timestamp",
+                    "elapsed_s",
+                    "trace_time_s",
+                    "bandwidth_mbps",
+                    "loss_ratio",
+                    "delay_ms",
+                    "interface",
+                ],
+            )
+            gt_writer.writeheader()
 
-            # Advance the time offset each time the trace wraps around
+        while True:
+            elapsed = time.perf_counter() - start_time
+            if args.duration is not None and elapsed >= args.duration:
+                break
+
+            current_idx = line_idx % num_lines
             if line_idx > 0 and current_idx == 0:
                 loop_offset += trace_duration
 
@@ -109,18 +141,35 @@ def main():
                 line_idx += 1
                 continue
 
-            # Columns: timestamp  bandwidth_mbps  rtt_ms  loss_fraction
-            target_time    = float(parts[0]) + loop_offset
+            target_time = float(parts[0]) + loop_offset
             bandwidth_mbps = float(parts[1])
-            # parts[2] is rtt_ms — read but not applied (delay is fixed)
-            loss_ratio     = max(0.0, float(parts[3]))
+            loss_ratio = max(0.0, float(parts[3]))
+            if args.loss_override is not None:
+                loss_ratio = max(0.0, float(args.loss_override))
+            delay_ms = (
+                FIXED_DELAY_MS
+                if args.delay_override_ms is None
+                else float(args.delay_override_ms)
+            )
 
-            # Wait until wall time matches the trace timestamp
             sleep_s = target_time - (time.perf_counter() - start_time)
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
-            update_tc(args.interface, bandwidth_mbps, loss_ratio)
+            applied_ts, _loss_pct, applied_delay_ms = update_tc(
+                args.interface, bandwidth_mbps, loss_ratio, delay_ms
+            )
+            if gt_writer is not None:
+                gt_writer.writerow({
+                    "monotonic_timestamp": f"{applied_ts:.9f}",
+                    "elapsed_s": f"{applied_ts - start_time:.9f}",
+                    "trace_time_s": f"{target_time:.9f}",
+                    "bandwidth_mbps": f"{bandwidth_mbps:.9f}",
+                    "loss_ratio": f"{loss_ratio:.9f}",
+                    "delay_ms": applied_delay_ms,
+                    "interface": args.interface,
+                })
+                gt_file.flush()
             line_idx += 1
 
     except KeyboardInterrupt:
@@ -128,6 +177,8 @@ def main():
     except Exception as e:
         print(f"\n[tc] Error: {e}")
     finally:
+        if gt_file is not None:
+            gt_file.close()
         cleanup_tc(args.interface)
 
 

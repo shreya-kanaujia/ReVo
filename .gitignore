@@ -6,5 +6,6 @@ src/lossrec/training
 *.pth
 __pycache__/
 *.log
+!src/sender/traces/week1_step_8_3_6_60s.log
 *.csv
 *.json
