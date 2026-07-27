@@ -18,6 +18,8 @@ VALIDATION_PACED_SOFT_BUFFER_LIMIT="${VALIDATION_PACED_SOFT_BUFFER_LIMIT:-32768}
 VALIDATION_PACED_BACKPRESSURE_SLEEP="${VALIDATION_PACED_BACKPRESSURE_SLEEP:-0.002}"
 ICE_CONSENT_TIMEOUT_S="${ICE_CONSENT_TIMEOUT_S:-5}"
 ENABLE_DIAGNOSTICS="${ENABLE_DIAGNOSTICS:-1}"
+LOSS_OVERRIDE="${LOSS_OVERRIDE-0.0}"
+RUN_STANDARD_ANALYZER="${RUN_STANDARD_ANALYZER:-1}"
 TRACE_PATH="${TRACE_PATH:-$ROOT_DIR/src/sender/traces/week1_step_8_3_6_60s.log}"
 TRACE_NAME="${TRACE_NAME:-step}"
 GT_CSV="${GT_CSV:-$OUT_DIR/ground_truth_${TRACE_NAME}.csv}"
@@ -99,13 +101,18 @@ RECEIVER_PID=$!
 sleep 2
 
 if [[ "$APPLY_TC" == "1" ]]; then
-  "$PYTHON" "$ROOT_DIR/src/sender/run_loss_trace.py" \
+  TRACE_ARGS=(
     --trace "$TRACE_PATH" \
     --interface "$IFACE" \
     --ground_truth_csv "$GT_CSV" \
     --duration "$RUN_SECONDS" \
-    --loss_override 0.0 \
-    --delay_override_ms 0 \
+    --delay_override_ms 0
+  )
+  if [[ -n "$LOSS_OVERRIDE" ]]; then
+    TRACE_ARGS+=(--loss_override "$LOSS_OVERRIDE")
+  fi
+  "$PYTHON" "$ROOT_DIR/src/sender/run_loss_trace.py" \
+    "${TRACE_ARGS[@]}" \
     > "$OUT_DIR/logs/tc_${TRACE_NAME}.log" 2>&1 &
   TRACE_PID=$!
   sleep 1
@@ -188,11 +195,14 @@ if [[ "$VALIDATION_PACED_PROBE_ONLY" == "1" ]]; then
   ANALYSIS_ARGS+=(--probe-sender "$PROBE_SENDER_CSV")
 fi
 
-set +e
-MPLCONFIGDIR="$OUT_DIR/.mplconfig" "$PYTHON" \
-  "$ROOT_DIR/scripts/analyze_capacity_estimator.py" "${ANALYSIS_ARGS[@]}"
-ANALYSIS_STATUS=$?
-set -e
+ANALYSIS_STATUS=0
+if [[ "$RUN_STANDARD_ANALYZER" == "1" ]]; then
+  set +e
+  MPLCONFIGDIR="$OUT_DIR/.mplconfig" "$PYTHON" \
+    "$ROOT_DIR/scripts/analyze_capacity_estimator.py" "${ANALYSIS_ARGS[@]}"
+  ANALYSIS_STATUS=$?
+  set -e
+fi
 
 echo "validation data collection finished:"
 echo "  ground truth: $GT_CSV"
@@ -200,8 +210,12 @@ echo "  estimator:    $CAPACITY_CSV"
 if [[ "$VALIDATION_PACED_PROBE_ONLY" == "1" ]]; then
   echo "  probe sender: $PROBE_SENDER_CSV"
 fi
-echo "  report:       $METRICS_REPORT"
-echo "  overlay:      $OVERLAY_PNG"
+if [[ "$RUN_STANDARD_ANALYZER" == "1" ]]; then
+  echo "  report:       $METRICS_REPORT"
+  echo "  overlay:      $OVERLAY_PNG"
+else
+  echo "  analyzer:     skipped (RUN_STANDARD_ANALYZER=0)"
+fi
 
 if [[ "$SENDER_STATUS" -ne 0 ]]; then
   echo "sender exited with status $SENDER_STATUS; validation failed" >&2

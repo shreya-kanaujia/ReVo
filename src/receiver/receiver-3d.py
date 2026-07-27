@@ -28,7 +28,7 @@ Pipeline overview:
                  saved_frames[]  ──►  write_video_pyav()
 """
 
-import argparse, asyncio, json, logging, sys
+import argparse, asyncio, csv, json, logging, sys
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaRecorder
 from aiohttp import ClientSession
@@ -49,10 +49,16 @@ import os
 from capacity_estimator import ArrivalCapacityEstimator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from capacity_feedback import (
+    MSG_CAPACITY_FEEDBACK,
+    encode_capacity_feedback,
+)
 from webrtc_diagnostics import (
     WebRTCDiagnostics,
     apply_ice_consent_timeout,
+    apply_sctp_gap_rtt_fix,
     enable_ice_debug_logging,
+    sctp_diagnostic_snapshot,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +76,6 @@ MSG_INIT  = 1   # stream parameters (width, height, fps, chunk sizes)
 MSG_DESC  = 2   # per-chunk descriptor (frame id, chunk index, FEC params, …)
 MSG_CHUNK = 3   # (unused; payload is appended directly after MSG_DESC)
 MSG_PROBE = 5   # validation-only packet-train probe
-MSG_CAPACITY_FEEDBACK = 6
 
 # ---------------------------------------------------------------------------
 # Binary wire formats (little-endian)
@@ -87,7 +92,6 @@ MSG_CAPACITY_FEEDBACK = 6
 FMT_INIT = "<BHHHHH"
 FMT_DESC = "<BBIIBHHHIQdd"
 FMT_PROBE = "<BQIIHd"
-FMT_CAPACITY_FEEDBACK = "<BQIddddd"
 
 # Frame-type tags that travel in the DESC header
 FRAME_TYPE_RGB   = 3
@@ -96,7 +100,6 @@ FRAME_TYPE_DEPTH = 4
 SZ_INIT = struct.calcsize(FMT_INIT)
 SZ_DESC = struct.calcsize(FMT_DESC)
 SZ_PROBE = struct.calcsize(FMT_PROBE)
-SZ_CAPACITY_FEEDBACK = struct.calcsize(FMT_CAPACITY_FEEDBACK)
 
 # Hard cap on in-flight frame slots to prevent unbounded memory growth
 MAX_FRAME_CHUNK_LIMIT = 2000
@@ -132,6 +135,8 @@ class Receiver():
         self.pc                = None
         self.ice_consent_timeout_s = args.ice_consent_timeout_s
         self._ice_consent_timeout_applied = False
+        self.validation_sctp_gap_rtt_fix = args.validation_sctp_gap_rtt_fix
+        self._sctp_gap_rtt_fix_applied = False
 
         # ── Stream parameters (overwritten by INIT message) ─────────────────
         self.pic_height        = 512
@@ -238,7 +243,19 @@ class Receiver():
         self.display_thread = None
 
         self._last_chunk_gc = time.perf_counter()
-        self.capacity_estimator = ArrivalCapacityEstimator(alpha=args.estimator_alpha)
+        self.capacity_estimator = ArrivalCapacityEstimator(
+            alpha=args.estimator_alpha,
+            robust_window_s=args.estimator_robust_window_s,
+            freshness_multiplier=args.estimator_freshness_multiplier,
+            freshness_min_s=args.estimator_freshness_min_s,
+            freshness_max_s=args.estimator_freshness_max_s,
+            recovery_samples=args.estimator_recovery_samples,
+            recovery_window_s=args.estimator_recovery_window_s,
+        )
+        self.receiver_capacity_csv_path = args.receiver_capacity_csv
+        self.receiver_capacity_file = None
+        self.receiver_capacity_writer = None
+        self._open_receiver_capacity_log()
         if args.diagnostic_ice:
             enable_ice_debug_logging()
         self.diagnostics = WebRTCDiagnostics(args.diagnostic_csv, "receiver")
@@ -295,6 +312,45 @@ class Receiver():
         """
         return self.clock_t0 + (fid + 1) * self.T
 
+    def _open_receiver_capacity_log(self):
+        if not self.receiver_capacity_csv_path:
+            return
+        parent = os.path.dirname(os.path.abspath(self.receiver_capacity_csv_path))
+        os.makedirs(parent, exist_ok=True)
+        self.receiver_capacity_file = open(
+            self.receiver_capacity_csv_path, "w", newline=""
+        )
+        self.receiver_capacity_writer = csv.DictWriter(
+            self.receiver_capacity_file,
+            fieldnames=[
+                "receiver_timestamp",
+                "sequence_id",
+                "packet_size_bytes",
+                "raw_interarrival_time",
+                "sender_grace_period",
+                "corrected_interarrival_time",
+                "smoothed_tau",
+                "estimated_capacity_mbps",
+                "filtered_smoothed_tau",
+                "filtered_estimated_capacity_mbps",
+                "published_estimated_capacity_mbps",
+                "estimate_age_s",
+                "estimate_fresh",
+                "freshness_threshold_s",
+                "last_valid_update_timestamp",
+                "skip_reason",
+                "filter_reason",
+                "feedback_sent",
+            ],
+        )
+        self.receiver_capacity_writer.writeheader()
+
+    def _close_receiver_capacity_log(self):
+        if self.receiver_capacity_file is not None:
+            self.receiver_capacity_file.close()
+            self.receiver_capacity_file = None
+            self.receiver_capacity_writer = None
+
     def _send_capacity_feedback(self, channel, *, seq_id, packet_size,
                                 receiver_ts, sender_grace_period):
         sample = self.capacity_estimator.observe(
@@ -303,24 +359,69 @@ class Receiver():
             sequence_id=seq_id,
             packet_size_bytes=packet_size,
         )
-        def encode_optional(value):
-            return -1.0 if value is None else float(value)
-        feedback = struct.pack(
-            FMT_CAPACITY_FEEDBACK,
-            MSG_CAPACITY_FEEDBACK,
-            int(seq_id),
-            int(packet_size),
-            float(receiver_ts),
-            encode_optional(sample["raw_interarrival"]),
-            float(sample["sender_grace_period"]),
-            encode_optional(sample["corrected_interarrival"]),
-            encode_optional(sample["ewma_interarrival"]),
-        )
+        feedback = encode_capacity_feedback({
+            "seq_id": seq_id,
+            "packet_size": packet_size,
+            "receiver_ts": receiver_ts,
+            **sample,
+        })
+        feedback_sent = False
         try:
             channel.send(feedback)
+            feedback_sent = True
             self.diagnostics.feedback_event(seq_id, receiver_ts)
         except Exception:
             logging.debug("[Receiver] capacity feedback send failed", exc_info=True)
+        if self.receiver_capacity_writer is not None:
+            ewma = sample["ewma_interarrival"]
+            capacity_mbps = (
+                None
+                if ewma is None or float(ewma) <= 0.0
+                else float(packet_size) * 8.0 / float(ewma) / 1_000_000.0
+            )
+            filtered_ewma = sample["filtered_ewma_interarrival"]
+            filtered_capacity_mbps = (
+                None
+                if filtered_ewma is None or float(filtered_ewma) <= 0.0
+                else float(packet_size) * 8.0
+                / float(filtered_ewma) / 1_000_000.0
+            )
+            published_capacity_mbps = (
+                filtered_capacity_mbps if sample["estimate_fresh"] else None
+            )
+            def format_optional(value):
+                return "" if value is None else f"{float(value):.9f}"
+            self.receiver_capacity_writer.writerow({
+                "receiver_timestamp": f"{float(receiver_ts):.9f}",
+                "sequence_id": int(seq_id),
+                "packet_size_bytes": int(packet_size),
+                "raw_interarrival_time": format_optional(sample["raw_interarrival"]),
+                "sender_grace_period": f"{float(sample['sender_grace_period']):.9f}",
+                "corrected_interarrival_time": format_optional(
+                    sample["corrected_interarrival"]
+                ),
+                "smoothed_tau": format_optional(ewma),
+                "estimated_capacity_mbps": format_optional(capacity_mbps),
+                "filtered_smoothed_tau": format_optional(filtered_ewma),
+                "filtered_estimated_capacity_mbps": format_optional(
+                    filtered_capacity_mbps
+                ),
+                "published_estimated_capacity_mbps": format_optional(
+                    published_capacity_mbps
+                ),
+                "estimate_age_s": format_optional(sample["estimate_age_s"]),
+                "estimate_fresh": "1" if sample["estimate_fresh"] else "0",
+                "freshness_threshold_s": format_optional(
+                    sample["freshness_threshold_s"]
+                ),
+                "last_valid_update_timestamp": format_optional(
+                    sample["last_valid_update_ts"]
+                ),
+                "skip_reason": sample["skip_reason"],
+                "filter_reason": sample["filter_reason"],
+                "feedback_sent": "1" if feedback_sent else "0",
+            })
+            self.receiver_capacity_file.flush()
 
     # ────────────────────────────────────────────────────────────────────────
     # Best-effort payload builder (P-frames with missing chunks)
@@ -723,6 +824,8 @@ class Receiver():
             "last_sent_sequence": "",
             "connection_state": self.pc.connectionState,
             "ice_state": self.pc.iceConnectionState,
+            **self.capacity_estimator.snapshot(time.perf_counter()),
+            **sctp_diagnostic_snapshot(self.pc),
         })
 
         # Start background worker threads
@@ -749,6 +852,10 @@ class Receiver():
         def on_datachannel(channel):
             logging.info("Receiver: DataChannel %s created", channel.label)
             self.diagnostic_channels[channel.label] = channel
+            if (self.validation_sctp_gap_rtt_fix
+                    and not self._sctp_gap_rtt_fix_applied):
+                apply_sctp_gap_rtt_fix(self.pc, "Receiver")
+                self._sctp_gap_rtt_fix_applied = True
 
             @channel.on("message")
             async def on_message(msg):
@@ -979,6 +1086,7 @@ class Receiver():
                     self.display_thread.join(timeout=1.0)
 
                 await self.diagnostics.stop()
+                self._close_receiver_capacity_log()
                 cv2.destroyAllWindows()
                 logging.info("[Receiver] Graceful shutdown complete")
 
@@ -1042,12 +1150,28 @@ if __name__ == "__main__":
                    help="Video codec for both RGB and depth streams")
     p.add_argument("--estimator_alpha", type=float, default=0.1,
                    help="EWMA alpha for passive receiver inter-arrival estimator")
+    p.add_argument("--estimator_robust_window_s", type=float, default=0.1,
+                   help="Causal median window in seconds for the separately published estimate")
+    p.add_argument("--estimator_freshness_multiplier", type=float, default=10.0,
+                   help="Valid-update cadence multiplier used for estimate freshness")
+    p.add_argument("--estimator_freshness_min_s", type=float, default=0.05,
+                   help="Minimum freshness timeout for live estimate publication")
+    p.add_argument("--estimator_freshness_max_s", type=float, default=1.0,
+                   help="Maximum freshness timeout for live estimate publication")
+    p.add_argument("--estimator_recovery_samples", type=int, default=5,
+                   help="Adjacent valid samples required after a stale interval")
+    p.add_argument("--estimator_recovery_window_s", type=float, default=0.1,
+                   help="Minimum adjacent-observation span before recovery publication")
+    p.add_argument("--receiver_capacity_csv", default="",
+                   help="Validation only: receiver arrival and estimator sample CSV")
     p.add_argument("--diagnostic_csv", default="",
                    help="Validation only: one-second receiver event-loop/feedback diagnostics")
     p.add_argument("--diagnostic_ice", action="store_true",
                    help="Validation only: timestamp aioice STUN consent traffic")
     p.add_argument("--ice_consent_timeout_s", type=float, default=None,
                    help="Validation only: aioice consent timeout applied after ICE completes")
+    p.add_argument("--validation_sctp_gap_rtt_fix", action="store_true",
+                   help="Validation only: ignore ambiguous RTT samples from already gap-ACKed SCTP data")
 
     args = p.parse_args()
     r    = Receiver(args)

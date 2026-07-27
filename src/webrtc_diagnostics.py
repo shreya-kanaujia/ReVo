@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+from collections import Counter
 
 
 class _MonotonicLogFilter(logging.Filter):
@@ -40,6 +41,140 @@ def apply_ice_consent_timeout(timeout_s, role):
     )
 
 
+def sender_grace_for_backpressure_pause(
+    inter_send_interval_s, buffered_amount, pause_duration_s
+):
+    """Mark an idle boundary only if the transport queue actually drained."""
+    if (
+        float(pause_duration_s) > 0.0
+        and int(buffered_amount) == 0
+        and inter_send_interval_s is not None
+    ):
+        return max(0.0, float(inter_send_interval_s))
+    return 0.0
+
+
+def apply_sctp_gap_rtt_fix(peer_connection, role):
+    """
+    Avoid treating an already gap-ACKed DATA chunk as a new RTT sample.
+
+    aiortc 1.14 updates its RTO when that chunk is later removed by a
+    cumulative SACK. Under partial reliability, the delay can include one or
+    more FORWARD-TSN timeout cycles and is therefore not an RTT measurement.
+    The resulting inflated RTO can leave the DataChannel queue blocked for
+    tens of seconds. This opt-in validation workaround suppresses only that
+    ambiguous sample; unambiguous cumulative ACK samples are unchanged.
+    """
+    sctp = getattr(peer_connection, "sctp", None)
+    if sctp is None:
+        raise RuntimeError("SCTP transport does not exist yet")
+    if getattr(sctp, "_revo_gap_rtt_fix_applied", False):
+        return
+
+    from aiortc.rtcsctptransport import uint32_gte
+
+    original_receive_sack = sctp._receive_sack_chunk
+    original_update_rto = sctp._update_rto
+    sctp._revo_gap_rtt_fix_applied = True
+    sctp._revo_suppress_rtt_sample = False
+    sctp._revo_suppressed_rtt_samples = 0
+    sctp._revo_last_suppressed_rtt_s = None
+
+    async def receive_sack(chunk):
+        sent_queue = getattr(sctp, "_sent_queue", ())
+        first = sent_queue[0] if sent_queue else None
+        sctp._revo_suppress_rtt_sample = bool(
+            first is not None
+            and getattr(first, "_acked", False)
+            and getattr(first, "_sent_count", 0) == 1
+            and uint32_gte(chunk.cumulative_tsn, first.tsn)
+        )
+        try:
+            await original_receive_sack(chunk)
+        finally:
+            sctp._revo_suppress_rtt_sample = False
+
+    def update_rto(sample_s):
+        if sctp._revo_suppress_rtt_sample:
+            sctp._revo_suppressed_rtt_samples += 1
+            sctp._revo_last_suppressed_rtt_s = float(sample_s)
+            return
+        original_update_rto(sample_s)
+
+    sctp._receive_sack_chunk = receive_sack
+    sctp._update_rto = update_rto
+    logging.warning(
+        "[%s] Applied validation-only aiortc gap-ACK RTT workaround", role
+    )
+
+
+def sctp_diagnostic_snapshot(peer_connection):
+    """Return a read-only snapshot of aiortc SCTP queues and timers."""
+    sctp = getattr(peer_connection, "sctp", None)
+    if sctp is None:
+        return {}
+
+    sent_queue = list(getattr(sctp, "_sent_queue", ()))
+    outbound_queue = list(getattr(sctp, "_outbound_queue", ()))
+    data_channel_queue = list(getattr(sctp, "_data_channel_queue", ()))
+    oldest = sent_queue[0] if sent_queue else None
+    t3_handle = getattr(sctp, "_t3_handle", None)
+    try:
+        t3_due_s = max(0.0, t3_handle.when() - asyncio.get_running_loop().time())
+    except (AttributeError, RuntimeError):
+        t3_due_s = None
+
+    sent_states = Counter(
+        "abandoned" if getattr(chunk, "_abandoned", False)
+        else "gap_acked" if getattr(chunk, "_acked", False)
+        else "retransmit" if getattr(chunk, "_retransmit", False)
+        else "outstanding"
+        for chunk in sent_queue
+    )
+    return {
+        "sctp_state": str(getattr(sctp, "state", "")),
+        "sctp_rto_s": getattr(sctp, "_rto", None),
+        "sctp_srtt_s": getattr(sctp, "_srtt", None),
+        "sctp_rttvar_s": getattr(sctp, "_rttvar", None),
+        "sctp_cwnd_bytes": getattr(sctp, "_cwnd", None),
+        "sctp_flight_size_bytes": getattr(sctp, "_flight_size", None),
+        "sctp_data_channel_queue": len(data_channel_queue),
+        "sctp_outbound_queue": len(outbound_queue),
+        "sctp_sent_queue": len(sent_queue),
+        "sctp_sent_outstanding": sent_states["outstanding"],
+        "sctp_sent_gap_acked": sent_states["gap_acked"],
+        "sctp_sent_abandoned": sent_states["abandoned"],
+        "sctp_sent_retransmit": sent_states["retransmit"],
+        "sctp_t3_active": bool(t3_handle),
+        "sctp_t3_due_s": t3_due_s,
+        "sctp_forward_tsn_pending": bool(
+            getattr(sctp, "_forward_tsn_chunk", None)
+        ),
+        "sctp_last_sacked_tsn": getattr(sctp, "_last_sacked_tsn", None),
+        "sctp_advanced_peer_ack_tsn": getattr(
+            sctp, "_advanced_peer_ack_tsn", None
+        ),
+        "sctp_oldest_tsn": getattr(oldest, "tsn", None),
+        "sctp_oldest_sent_count": getattr(oldest, "_sent_count", None),
+        "sctp_oldest_misses": getattr(oldest, "_misses", None),
+        "sctp_oldest_gap_acked": (
+            bool(getattr(oldest, "_acked", False)) if oldest else ""
+        ),
+        "sctp_oldest_abandoned": (
+            bool(getattr(oldest, "_abandoned", False)) if oldest else ""
+        ),
+        "sctp_gap_rtt_fix_applied": bool(
+            getattr(sctp, "_revo_gap_rtt_fix_applied", False)
+        ),
+        "sctp_suppressed_rtt_samples": getattr(
+            sctp, "_revo_suppressed_rtt_samples", 0
+        ),
+        "sctp_last_suppressed_rtt_s": getattr(
+            sctp, "_revo_last_suppressed_rtt_s", None
+        ),
+    }
+
+
 class WebRTCDiagnostics:
     FIELDNAMES = [
         "timestamp_monotonic",
@@ -56,6 +191,39 @@ class WebRTCDiagnostics:
         "last_feedback_sequence",
         "connection_state",
         "ice_state",
+        "raw_estimated_capacity_mbps",
+        "filtered_estimated_capacity_mbps",
+        "published_estimated_capacity_mbps",
+        "estimate_age_s",
+        "estimate_fresh",
+        "freshness_threshold_s",
+        "last_valid_update_ts",
+        "sctp_state",
+        "sctp_rto_s",
+        "sctp_srtt_s",
+        "sctp_rttvar_s",
+        "sctp_cwnd_bytes",
+        "sctp_flight_size_bytes",
+        "sctp_data_channel_queue",
+        "sctp_outbound_queue",
+        "sctp_sent_queue",
+        "sctp_sent_outstanding",
+        "sctp_sent_gap_acked",
+        "sctp_sent_abandoned",
+        "sctp_sent_retransmit",
+        "sctp_t3_active",
+        "sctp_t3_due_s",
+        "sctp_forward_tsn_pending",
+        "sctp_last_sacked_tsn",
+        "sctp_advanced_peer_ack_tsn",
+        "sctp_oldest_tsn",
+        "sctp_oldest_sent_count",
+        "sctp_oldest_misses",
+        "sctp_oldest_gap_acked",
+        "sctp_oldest_abandoned",
+        "sctp_gap_rtt_fix_applied",
+        "sctp_suppressed_rtt_samples",
+        "sctp_last_suppressed_rtt_s",
     ]
 
     def __init__(self, path, role):

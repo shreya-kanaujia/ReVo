@@ -45,10 +45,18 @@ import bisect
 import csv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from capacity_feedback import (
+    MSG_CAPACITY_FEEDBACK,
+    SIZE as SZ_CAPACITY_FEEDBACK,
+    decode_capacity_feedback,
+)
 from webrtc_diagnostics import (
     WebRTCDiagnostics,
     apply_ice_consent_timeout,
+    apply_sctp_gap_rtt_fix,
     enable_ice_debug_logging,
+    sctp_diagnostic_snapshot,
+    sender_grace_for_backpressure_pause,
 )
 
 # ANSI color codes for log readability
@@ -73,7 +81,6 @@ MSG_DESC         = 2   # per-chunk descriptor (precedes every data shard)
 FRAME_TYPE_RGB   = 3
 FRAME_TYPE_DEPTH = 4
 MSG_PROBE        = 5   # validation-only packet train probe
-MSG_CAPACITY_FEEDBACK = 6
 
 # ---------------------------------------------------------------------------
 # Binary wire formats (little-endian)
@@ -90,11 +97,9 @@ MSG_CAPACITY_FEEDBACK = 6
 FMT_INIT = "<BHHHHH"
 FMT_DESC = "<BBIIBHHHIQdd"
 FMT_PROBE = "<BQIIHd"
-FMT_CAPACITY_FEEDBACK = "<BQIddddd"
 SZ_INIT  = struct.calcsize(FMT_INIT)
 SZ_DESC  = struct.calcsize(FMT_DESC)
 SZ_PROBE = struct.calcsize(FMT_PROBE)
-SZ_CAPACITY_FEEDBACK = struct.calcsize(FMT_CAPACITY_FEEDBACK)
 
 
 class Sender():
@@ -132,6 +137,7 @@ class Sender():
         self.data_channel_depth= None
         self.ice_consent_timeout_s = args.ice_consent_timeout_s
         self._ice_consent_timeout_applied = False
+        self.validation_sctp_gap_rtt_fix = args.validation_sctp_gap_rtt_fix
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
@@ -186,6 +192,17 @@ class Sender():
         self.last_acknowledged_sequence = 0
         self.last_packet_send_ts = None
         self.outstanding_packets = {}  # seq_id -> packet byte length
+        self.outstanding_packet_send_times = {}
+        self.latest_capacity_state = {
+            "raw_estimated_capacity_mbps": None,
+            "filtered_estimated_capacity_mbps": None,
+            "published_estimated_capacity_mbps": None,
+            "estimate_age_s": None,
+            "estimate_fresh": False,
+            "freshness_threshold_s": None,
+            "last_valid_update_ts": None,
+            "feedback_received_ts": None,
+        }
         if args.diagnostic_ice:
             enable_ice_debug_logging()
         self.diagnostics = WebRTCDiagnostics(args.diagnostic_csv, "sender")
@@ -275,6 +292,7 @@ class Sender():
             self.capacity_file,
             fieldnames=[
                 "timestamp",
+                "receiver_timestamp",
                 "acknowledged_sequence_number",
                 "last_sent_sequence_number",
                 "packets_outstanding",
@@ -287,6 +305,16 @@ class Sender():
                 "estimated_packet_service_rate",
                 "estimated_capacity_bytes_per_sec",
                 "estimated_capacity_mbps",
+                "filtered_smoothed_tau",
+                "filtered_estimated_capacity_mbps",
+                "published_estimated_capacity_mbps",
+                "estimate_age_s",
+                "estimate_fresh",
+                "freshness_threshold_s",
+                "last_valid_update_timestamp",
+                "skip_reason",
+                "filter_reason",
+                "filter_applied",
                 "max_frame_size_bytes",
                 "rgb_bufferedAmount",
                 "depth_bufferedAmount",
@@ -319,6 +347,9 @@ class Sender():
                 "datachannel_bufferedAmount",
                 "sent",
                 "paused_due_to_backpressure",
+                "backpressure_pause_duration_seconds",
+                "sender_grace_period",
+                "schedule_reset_due_to_lateness",
                 "cumulative_probe_bytes_sent",
             ],
         )
@@ -332,7 +363,10 @@ class Sender():
 
     def _log_probe_sender(self, *, timestamp, seq_id, payload_bytes, bitrate_mbps,
                           packet_interval, actual_interval, lateness,
-                          buffered_amount, sent, paused, cumulative_bytes):
+                          buffered_amount, sent, paused, cumulative_bytes,
+                          backpressure_pause_duration=0.0,
+                          sender_grace_period=0.0,
+                          schedule_reset_due_to_lateness=False):
         if self.probe_sender_writer is None:
             return
         self.probe_sender_writer.writerow({
@@ -346,6 +380,13 @@ class Sender():
             "datachannel_bufferedAmount": int(buffered_amount),
             "sent": "1" if sent else "0",
             "paused_due_to_backpressure": "1" if paused else "0",
+            "backpressure_pause_duration_seconds": (
+                f"{float(backpressure_pause_duration):.9f}"
+            ),
+            "sender_grace_period": f"{float(sender_grace_period):.9f}",
+            "schedule_reset_due_to_lateness": (
+                "1" if schedule_reset_due_to_lateness else "0"
+            ),
             "cumulative_probe_bytes_sent": int(cumulative_bytes),
         })
         self.probe_sender_file.flush()
@@ -358,18 +399,9 @@ class Sender():
         if isinstance(msg, bytes):
             if len(msg) != SZ_CAPACITY_FEEDBACK or msg[0] != MSG_CAPACITY_FEEDBACK:
                 return
-            (_mtype, seq_id, packet_size, receiver_ts, raw, grace,
-             corrected, ewma) = struct.unpack(FMT_CAPACITY_FEEDBACK, msg)
-            feedback = {
-                "type": "capacity_feedback",
-                "seq_id": int(seq_id),
-                "packet_size": int(packet_size),
-                "receiver_ts": receiver_ts,
-                "raw_interarrival": None if raw < 0 else raw,
-                "sender_grace_period": grace,
-                "corrected_interarrival": None if corrected < 0 else corrected,
-                "ewma_interarrival": None if ewma < 0 else ewma,
-            }
+            feedback = decode_capacity_feedback(msg)
+            if feedback is None:
+                return
         elif isinstance(msg, str):
             try:
                 feedback = json.loads(msg)
@@ -381,12 +413,20 @@ class Sender():
             return
 
         seq_id = int(feedback.get("seq_id", 0))
+        feedback_received_ts = time.perf_counter()
         self.diagnostics.feedback_event(seq_id)
         packet_size = int(feedback.get("packet_size", 0))
         if seq_id > self.last_acknowledged_sequence:
             self.last_acknowledged_sequence = seq_id
         acknowledged_bytes = self.outstanding_packets.pop(seq_id, packet_size)
+        packet_send_ts = self.outstanding_packet_send_times.pop(seq_id, None)
+        feedback_transport_delay = (
+            0.0
+            if packet_send_ts is None
+            else max(0.0, feedback_received_ts - packet_send_ts)
+        )
         ewma = feedback.get("ewma_interarrival")
+        filtered_ewma = feedback.get("filtered_ewma_interarrival")
         packets_outstanding = max(0, self.last_sent_sequence - self.last_acknowledged_sequence)
         capacity_bps = None
         service_rate_pps = None
@@ -399,6 +439,51 @@ class Sender():
             )
             max_frame_size = max(0.0, max_frame_size)
         capacity_mbps = None if capacity_bps is None else capacity_bps * 8.0 / 1_000_000.0
+        filtered_capacity_mbps = (
+            None
+            if filtered_ewma is None or float(filtered_ewma) <= 0.0
+            else float(packet_size or acknowledged_bytes) * 8.0
+            / float(filtered_ewma) / 1_000_000.0
+        )
+        receiver_age = feedback.get("estimate_age_s")
+        estimate_age = (
+            None
+            if receiver_age is None
+            else max(0.0, float(receiver_age)) + feedback_transport_delay
+        )
+        freshness_threshold = feedback.get("freshness_threshold_s")
+        estimate_fresh = (
+            bool(feedback.get("estimate_fresh"))
+            and estimate_age is not None
+            and freshness_threshold is not None
+            and estimate_age <= float(freshness_threshold)
+        )
+        published_capacity_mbps = (
+            filtered_capacity_mbps if estimate_fresh else None
+        )
+        last_valid_update_ts = feedback.get("last_valid_update_ts")
+        if last_valid_update_ts is None and receiver_age is not None:
+            last_valid_update_ts = (
+                float(feedback.get("receiver_ts", 0.0)) - float(receiver_age)
+            )
+        skip_reason = feedback.get("skip_reason", "")
+        filter_applied = (
+            ewma is not None
+            and filtered_ewma is not None
+            and not math.isclose(
+                float(ewma), float(filtered_ewma), rel_tol=1e-12, abs_tol=1e-15
+            )
+        )
+        self.latest_capacity_state = {
+            "raw_estimated_capacity_mbps": capacity_mbps,
+            "filtered_estimated_capacity_mbps": filtered_capacity_mbps,
+            "published_estimated_capacity_mbps": published_capacity_mbps,
+            "estimate_age_s": estimate_age,
+            "estimate_fresh": estimate_fresh,
+            "freshness_threshold_s": freshness_threshold,
+            "last_valid_update_ts": last_valid_update_ts,
+            "feedback_received_ts": feedback_received_ts,
+        }
 
         logging.debug(
             "[Estimator] ack seq=%d last_sent=%d outstanding=%d tau=%s max_frame=%s",
@@ -408,7 +493,8 @@ class Sender():
 
         if self.capacity_writer is not None:
             self.capacity_writer.writerow({
-                "timestamp": f"{time.perf_counter():.9f}",
+                "timestamp": f"{feedback_received_ts:.9f}",
+                "receiver_timestamp": self._fmt_float(feedback.get("receiver_ts")),
                 "acknowledged_sequence_number": seq_id,
                 "last_sent_sequence_number": self.last_sent_sequence,
                 "packets_outstanding": packets_outstanding,
@@ -421,11 +507,47 @@ class Sender():
                 "estimated_packet_service_rate": self._fmt_float(service_rate_pps),
                 "estimated_capacity_bytes_per_sec": self._fmt_float(capacity_bps),
                 "estimated_capacity_mbps": self._fmt_float(capacity_mbps),
+                "filtered_smoothed_tau": self._fmt_float(filtered_ewma),
+                "filtered_estimated_capacity_mbps": self._fmt_float(
+                    filtered_capacity_mbps
+                ),
+                "published_estimated_capacity_mbps": self._fmt_float(
+                    published_capacity_mbps
+                ),
+                "estimate_age_s": self._fmt_float(estimate_age),
+                "estimate_fresh": "1" if estimate_fresh else "0",
+                "freshness_threshold_s": self._fmt_float(freshness_threshold),
+                "last_valid_update_timestamp": self._fmt_float(
+                    last_valid_update_ts
+                ),
+                "skip_reason": skip_reason,
+                "filter_reason": feedback.get("filter_reason", ""),
+                "filter_applied": "1" if filter_applied else "0",
                 "max_frame_size_bytes": self._fmt_float(max_frame_size),
                 "rgb_bufferedAmount": int(self.data_channel_rgb.bufferedAmount) if self.data_channel_rgb else "",
                 "depth_bufferedAmount": int(self.data_channel_depth.bufferedAmount) if self.data_channel_depth else "",
             })
             self.capacity_file.flush()
+
+    def _current_capacity_state(self):
+        """Return the control-safe state, aging it while feedback is absent."""
+        state = dict(self.latest_capacity_state)
+        received_ts = state.pop("feedback_received_ts", None)
+        age = state.get("estimate_age_s")
+        threshold = state.get("freshness_threshold_s")
+        if received_ts is not None and age is not None:
+            age = max(0.0, float(age) + time.perf_counter() - received_ts)
+            state["estimate_age_s"] = age
+        fresh = (
+            bool(state.get("estimate_fresh"))
+            and age is not None
+            and threshold is not None
+            and age <= float(threshold)
+        )
+        state["estimate_fresh"] = fresh
+        if not fresh:
+            state["published_estimated_capacity_mbps"] = None
+        return state
 
     def start_trace(self):
         """
@@ -527,6 +649,7 @@ class Sender():
         dc.send(packet)
         self.last_packet_send_ts = send_ts
         self.outstanding_packets[seq_id] = len(packet)
+        self.outstanding_packet_send_times[seq_id] = send_ts
         self.diagnostics.packet_sent(seq_id, send_ts)
         return True, len(packet)
 
@@ -542,9 +665,11 @@ class Sender():
             int(packets_in_burst), float(max(0.0, sender_grace))
         )
         packet = hdr + (b"\x00" * payload_len)
+        send_ts = time.perf_counter()
         dc.send(packet)
         self.outstanding_packets[seq_id] = len(packet)
-        self.diagnostics.packet_sent(seq_id, time.perf_counter())
+        self.outstanding_packet_send_times[seq_id] = send_ts
+        self.diagnostics.packet_sent(seq_id, send_ts)
         return seq_id, len(packet)
 
     def _send_paced_probe_packet(self, dc, *, payload_size, packet_index,
@@ -558,9 +683,11 @@ class Sender():
             0, float(max(0.0, sender_grace))
         )
         packet = hdr + (b"\x00" * max(0, int(payload_size)))
+        send_ts = time.perf_counter()
         dc.send(packet)
         self.outstanding_packets[seq_id] = len(packet)
-        self.diagnostics.packet_sent(seq_id, time.perf_counter())
+        self.outstanding_packet_send_times[seq_id] = send_ts
+        self.diagnostics.packet_sent(seq_id, send_ts)
         return seq_id, len(packet)
 
     # ────────────────────────────────────────────────────────────────────────
@@ -642,6 +769,17 @@ class Sender():
         bitrate_bps = bitrate_mbps * 1_000_000.0
         packet_interval = (payload_size * 8.0) / bitrate_bps
 
+        start_signal_path = self.args.validation_start_signal_path
+        if start_signal_path:
+            logging.info("[PacedProbe] waiting for validation start signal: %s",
+                         start_signal_path)
+            while not os.path.exists(start_signal_path):
+                if dc.readyState != "open":
+                    logging.warning("[PacedProbe] DataChannel closed while waiting for start signal")
+                    return
+                await asyncio.sleep(0.01)
+            logging.info("[PacedProbe] validation start signal observed")
+
         logging.info(
             "[PacedProbe] duration=%.3fs offered=%.3f Mbps payload=%dB interval=%.9fs soft_buffer=%dB",
             duration_s, bitrate_mbps, payload_size, packet_interval, soft_limit
@@ -655,6 +793,7 @@ class Sender():
         pause_events = 0
         missed_deadlines = 0
         max_buffered = 0
+        backpressure_pause_started = None
 
         while time.perf_counter() < end_time:
             if dc.readyState != "open":
@@ -674,12 +813,17 @@ class Sender():
 
             if buffered > soft_limit:
                 pause_events += 1
+                if backpressure_pause_started is None:
+                    backpressure_pause_started = now
                 self._log_probe_sender(
                     timestamp=now, seq_id=None, payload_bytes=payload_size,
                     bitrate_mbps=bitrate_mbps, packet_interval=packet_interval,
                     actual_interval=None if last_send_ts is None else now - last_send_ts,
                     lateness=lateness, buffered_amount=buffered, sent=False,
                     paused=True, cumulative_bytes=cumulative_bytes,
+                    backpressure_pause_duration=(
+                        now - backpressure_pause_started
+                    ),
                 )
                 await asyncio.sleep(pause_s)
                 # Keep schedule deadline-based, but avoid replaying a huge backlog
@@ -690,14 +834,25 @@ class Sender():
 
             send_start = time.perf_counter()
             actual_interval = None if last_send_ts is None else send_start - last_send_ts
+            backpressure_pause_duration = (
+                0.0
+                if backpressure_pause_started is None
+                else max(0.0, send_start - backpressure_pause_started)
+            )
+            schedule_reset_due_to_lateness = lateness > packet_interval
+            sender_grace = sender_grace_for_backpressure_pause(
+                actual_interval, buffered, backpressure_pause_duration
+            )
             seq_id, packet_len = self._send_paced_probe_packet(
                 dc,
                 payload_size=payload_size,
                 packet_index=sent_packets,
-                # Deadline pacing keeps this train continuously offered.  Its
-                # ordinary inter-send interval is not sender-created idle time.
-                sender_grace=0.0,
+                # A nonempty transport queue remains continuously offered.
+                # Only a pause that fully drains bufferedAmount is a
+                # receiver-visible sender-idle boundary.
+                sender_grace=sender_grace,
             )
+            backpressure_pause_started = None
             last_send_ts = time.perf_counter()
             self.last_packet_send_ts = last_send_ts
             sent_packets += 1
@@ -708,8 +863,16 @@ class Sender():
                 actual_interval=actual_interval, lateness=lateness,
                 buffered_amount=buffered, sent=True, paused=False,
                 cumulative_bytes=cumulative_bytes,
+                backpressure_pause_duration=backpressure_pause_duration,
+                sender_grace_period=sender_grace,
+                schedule_reset_due_to_lateness=schedule_reset_due_to_lateness,
             )
-            next_deadline += packet_interval
+            # Never replay missed application deadlines as a sub-interval
+            # catch-up burst; resume causal pacing from the actual send time.
+            if schedule_reset_due_to_lateness:
+                next_deadline = send_start + packet_interval
+            else:
+                next_deadline += packet_interval
             await asyncio.sleep(0)
 
         elapsed = time.perf_counter() - start
@@ -1123,6 +1286,8 @@ class Sender():
         # real-time video, so we skip retransmission at the SCTP layer entirely.
         self.data_channel_rgb   = self.pc.createDataChannel("rgb_payload",   ordered=False, maxRetransmits=0)
         self.data_channel_depth = self.pc.createDataChannel("depth_payload", ordered=False, maxRetransmits=0)
+        if self.validation_sctp_gap_rtt_fix:
+            apply_sctp_gap_rtt_fix(self.pc, "Sender")
         self.diagnostics.start(lambda: {
             "rgb_buffered_amount": int(self.data_channel_rgb.bufferedAmount),
             "depth_buffered_amount": int(self.data_channel_depth.bufferedAmount),
@@ -1130,6 +1295,8 @@ class Sender():
             "last_sent_sequence": self.last_sent_sequence,
             "connection_state": self.pc.connectionState,
             "ice_state": self.pc.iceConnectionState,
+            **self._current_capacity_state(),
+            **sctp_diagnostic_snapshot(self.pc),
         })
 
         self.i_open = asyncio.Event()   # set when rgb_payload channel is open
@@ -1286,6 +1453,8 @@ if __name__ == "__main__":
                    help="Validation only: timestamp aioice STUN consent traffic")
     p.add_argument("--ice_consent_timeout_s", type=float, default=None,
                    help="Validation only: aioice consent timeout applied after ICE completes")
+    p.add_argument("--validation_sctp_gap_rtt_fix", action="store_true",
+                   help="Validation only: ignore ambiguous RTT samples from already gap-ACKed SCTP data")
     p.add_argument("--validation_train_only", action="store_true",
                    help="Validation only: send synthetic packet trains instead of ReVo video frames")
     p.add_argument("--validation_train_duration", type=float, default=60.0,
@@ -1308,6 +1477,8 @@ if __name__ == "__main__":
                    help="Validation-only soft DataChannel bufferedAmount limit before pausing probes")
     p.add_argument("--validation_paced_backpressure_sleep", type=float, default=0.002,
                    help="Validation-only sleep when probe bufferedAmount exceeds the soft limit")
+    p.add_argument("--validation_start_signal_path", default="",
+                   help="Validation only: wait for this file before starting the paced probe")
 
     args = p.parse_args()
     s    = Sender(args)
