@@ -141,19 +141,19 @@ class Sender():
 
         # ── Adaptive-quality state ───────────────────────────────────────────
         self.recv_miss_rate = 0.0  # deadline-miss rate last reported by the receiver (%)
-        self.quality_levels = {"rgb": 0, "depth": 0}
+        self.quality_levels = {"rgb": 1, "depth": 1} #default to mid-level quality (0=hi, 1=mid, 2=lo)
         self.quality_streaks = {"rgb": 0, "depth": 0}
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
-        self.codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_HI)
+        self.codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_MID)
         if args.codec == "dcvcrt":
             self.codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
             self.codec = h264.H264VideoCodec(intra_period=30)
 
         # Depth codec (mirrors RGB codec choice)
-        self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_HI)
+        self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_MID)
         if args.codec == "dcvcrt":
             self.depth_codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
@@ -164,14 +164,11 @@ class Sender():
         self.rgb_codecs = [self.codec]
         self.depth_codecs = [self.depth_codec]
         if SALSIFY_MODE and args.codec == "h265":
-            self.rgb_codecs.extend(
-                h265.H265VideoCodec(intra_period=30, qp=qp)
-                for qp in (SALSIFY_RGB_QP_MID, SALSIFY_RGB_QP_LO)
-            )
-            self.depth_codecs.extend(
-                h265.H265VideoCodec(intra_period=30, qp=qp)
-                for qp in (SALSIFY_DEPTH_QP_MID, SALSIFY_DEPTH_QP_LO)
-            )
+             self.rgb_codecs.insert(0, h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_HI))
+             self.rgb_codecs.append(h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_LO))
+
+             self.depth_codecs.insert(0,h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_HI))
+             self.depth_codecs.append(h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_LO))
 
         # ── Byte / frame counters ────────────────────────────────────────────
         self.total_bytes_sent           = 0
@@ -420,8 +417,7 @@ class Sender():
                                 "depth": (ba_depth > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
                                           or self.recv_miss_rate > SALSIFY_MISS_THRESH),
                             }
-                            for stream, codecs in (("rgb", self.rgb_codecs),
-                                                   ("depth", self.depth_codecs)):
+                            for stream, codecs in (("rgb", self.rgb_codecs), ("depth", self.depth_codecs)):
                                 current = self.quality_levels[stream]
                                 target = (min(current + 1, len(codecs) - 1)
                                           if pressures[stream] else max(current - 1, 0))
