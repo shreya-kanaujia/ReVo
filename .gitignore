@@ -1,11 +1,23 @@
-./output/
+/output/
 ./checkpoints/
+.checkpoints/.cache/
+.venv/
+.cache/
+build/
+dataset_download/
 src/lossrec/training
 
 #common large files
+.DS_Store
 *.pth
+*.py[cod]
 __pycache__/
+**/__pycache__/
+*.backup
+*.bak
+*~
 *.log
+!src/sender/traces/constant_loss_1pct_360s.log
 !src/sender/traces/week1_step_8_3_6_60s.log
 *.csv
 *.json

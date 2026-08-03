@@ -147,7 +147,7 @@ Trace script automatically `run_loss_trace.py` launches as a subprocess.
 <timestamp_s>  <bandwidth_mbps>  <rtt_ms>  <loss_0_to_1>
 ```
 
-The RTT column is parsed but **not applied** — one-way delay is fixed at 40 ms
+The RTT column is parsed but **not applied** — netem delay is fixed at 0 ms
 (`FIXED_DELAY_MS` in `run_loss_trace.py`).  The trace loops automatically.
 
 > **Note:** `tc` rules in `run_loss_trace.py` require `sudo`.  The trace is always cleaned up on exit,
@@ -177,5 +177,4 @@ I-bytes RGB (total):  4.24 MB  (data 2.83 MB + parity 1.41 MB)
 ## Troubleshooting
 
 See [FAQ.md](../../FAQ.md) for known issues and workarounds.
-
 

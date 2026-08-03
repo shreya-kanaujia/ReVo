@@ -28,6 +28,11 @@ MEASUREMENT_CSV="${MEASUREMENT_CSV:-$OUT_DIR/sender_frame_measurements_${TRACE_N
 PROBE_SENDER_CSV="${PROBE_SENDER_CSV:-$OUT_DIR/probe_sender_${TRACE_NAME}.csv}"
 SENDER_DIAGNOSTIC_CSV="${SENDER_DIAGNOSTIC_CSV:-$OUT_DIR/sender_diagnostics_${TRACE_NAME}.csv}"
 RECEIVER_DIAGNOSTIC_CSV="${RECEIVER_DIAGNOSTIC_CSV:-$OUT_DIR/receiver_diagnostics_${TRACE_NAME}.csv}"
+CONTROLLER_CSV="${CONTROLLER_CSV:-}"
+ADAPTATION_MODE="${ADAPTATION_MODE:-legacy}"
+RECEIVER_HEALTH_WINDOW_FRAMES="${RECEIVER_HEALTH_WINDOW_FRAMES:-30}"
+RECEIVER_HEALTH_FRESHNESS_S="${RECEIVER_HEALTH_FRESHNESS_S:-2.5}"
+TRACK_B_EXTRA_ARGS="${TRACK_B_EXTRA_ARGS:-}"
 OVERLAY_PNG="${OVERLAY_PNG:-$OUT_DIR/capacity_overlay_${TRACE_NAME}.png}"
 MAX_FRAME_PNG="${MAX_FRAME_PNG:-$OUT_DIR/max_frame_size_${TRACE_NAME}.png}"
 METRICS_REPORT="${METRICS_REPORT:-$OUT_DIR/capacity_metrics_${TRACE_NAME}.txt}"
@@ -39,7 +44,7 @@ IFACE="${IFACE:-}"
 
 mkdir -p "$OUT_DIR/input" "$OUT_DIR/logs"
 
-if [[ "$(uname -s)" != "Linux" ]]; then
+if [[ "$APPLY_TC" == "1" && "$(uname -s)" != "Linux" ]]; then
   echo "This validation requires Linux tc. Run inside a privileged Linux VM/container." >&2
   exit 1
 fi
@@ -56,11 +61,15 @@ if [[ ! -f "$DEPTH_INPUT" ]]; then
   ffmpeg -y -stream_loop -1 -i "$DEPTH_SOURCE" -t "$RUN_SECONDS" -c copy "$DEPTH_INPUT"
 fi
 
-if [[ -z "$IFACE" ]]; then
+if [[ "$APPLY_TC" == "0" && "$(uname -s)" != "Linux" ]]; then
+  IFACE="${IFACE:-lo0}"
+  HOST_IP="127.0.0.1"
+elif [[ -z "$IFACE" ]]; then
   IFACE="$(ip -o route show default | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  HOST_IP="$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)"
+else
+  HOST_IP="$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)"
 fi
-
-HOST_IP="$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)"
 if [[ -z "$HOST_IP" ]]; then
   echo "Could not determine IPv4 address for $IFACE" >&2
   exit 1
@@ -95,6 +104,7 @@ sleep 1
     --server_ip "$HOST_IP" \
     --codec "$CODEC" \
     --estimator_alpha 0.1 \
+    --receiver_health_window_frames "$RECEIVER_HEALTH_WINDOW_FRAMES" \
     "${RECEIVER_EXTRA_ARGS[@]}"
 ) > "$OUT_DIR/logs/receiver_${TRACE_NAME}.log" 2>&1 &
 RECEIVER_PID=$!
@@ -128,6 +138,19 @@ fi
 (
   cd "$ROOT_DIR/src/sender"
   EXTRA_ARGS=(--ice_consent_timeout_s "$ICE_CONSENT_TIMEOUT_S")
+  EXTRA_ARGS+=(
+    --adaptation_mode "$ADAPTATION_MODE"
+    --receiver_health_freshness_s "$RECEIVER_HEALTH_FRESHNESS_S"
+  )
+  if [[ -n "$CONTROLLER_CSV" ]]; then
+    EXTRA_ARGS+=(--controller_csv "$CONTROLLER_CSV")
+  fi
+  if [[ -n "$TRACK_B_EXTRA_ARGS" ]]; then
+    # Track B tuning is passed as explicit CLI tokens; defaults stay frozen
+    # unless the caller intentionally provides an override.
+    read -r -a TRACK_B_ARGS <<< "$TRACK_B_EXTRA_ARGS"
+    EXTRA_ARGS+=("${TRACK_B_ARGS[@]}")
+  fi
   if [[ "$ENABLE_DIAGNOSTICS" == "1" ]]; then
     EXTRA_ARGS+=(
       --diagnostic_csv "$SENDER_DIAGNOSTIC_CSV"

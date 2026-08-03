@@ -19,10 +19,14 @@ class H265VideoCodec:
 
     def __init__(self,
                  qp: int = 30,#22,#30,
-                 intra_period: int = 30):
+                 intra_period: int = 30,
+                 pool_threads: int | None = None):
         self.qp_i = qp
         self.qp_p = qp
         self.intra_period = intra_period
+        self.pool_threads = (
+            None if pool_threads is None else max(1, int(pool_threads))
+        )
         self.enc = None
         self.dec = None
         self.width = None
@@ -51,16 +55,19 @@ class H265VideoCodec:
         # Choose one QP for the whole stream.
         qp_stream = self.qp_p
 
+        x265_params = (
+            f"qp={qp_stream}:"
+            f"keyint={self.intra_period}:"
+            f"min-keyint={self.intra_period}:"
+            "scenecut=0:bframes=0:rc-lookahead=0:no-scenecut=1:frame-threads=1"
+        )
+        if self.pool_threads is not None:
+            x265_params += f":pools={self.pool_threads}"
         ctx.options = {
             "preset": "ultrafast",
             "tune": "zerolatency",  # avoid latency / lookahead
             # constant-QP, no B-frames, fixed keyint, minimal buffering
-            "x265-params": (
-                f"qp={qp_stream}:"
-                f"keyint={self.intra_period}:"
-                f"min-keyint={self.intra_period}:"
-                "scenecut=0:bframes=0:rc-lookahead=0:no-scenecut=1:frame-threads=1"
-            ),
+            "x265-params": x265_params,
         }
         ctx.open()
         self.enc = ctx
@@ -90,20 +97,29 @@ class H265VideoCodec:
               ...
             }
         """
-        _, _, C, H, W = frames.shape
+        x = self.prepare_input(frames)
+        yield from self.compress_prepared(x, frame_id, fps=fps)
+
+    @staticmethod
+    def prepare_input(frames: torch.Tensor):
+        """Convert a source tensor once for reuse by independent QP encoders."""
+        _, _, C, _, _ = frames.shape
         assert C == 3, "Expected RGB (C=3)"
+        x = frames[0, 0]  # (C, H, W)
+        if x.dtype != torch.uint8:
+            x = (x.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        return x.permute(1, 2, 0).contiguous().cpu().numpy()
+
+    def compress_prepared(self, rgb_array, frame_id: int, fps: int = 30):
+        """Encode a prepared, read-only RGB ndarray with this codec context."""
+        H, W, C = rgb_array.shape
+        assert C == 3, "Expected RGB (H,W,3)"
         self._ensure_encoder(W, H, fps)
 
         # remember which *input* frame this call corresponds to
         self._inflight_ids.append(frame_id)
 
-        # torch -> uint8 RGB ndarray (H, W, 3)
-        x = frames[0, 0]  # (C, H, W)
-        if x.dtype != torch.uint8:
-            x = (x.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-        x = x.permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
-
-        frame = av.VideoFrame.from_ndarray(x, format="rgb24")
+        frame = av.VideoFrame.from_ndarray(rgb_array, format="rgb24")
 
         # Encode this frame; libx265 may or may not output a packet yet.
         packets = self.enc.encode(frame)

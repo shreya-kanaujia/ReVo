@@ -44,7 +44,14 @@ def test_named_columns_and_single_conversion():
 
 
 def test_median_bounds_and_causality():
-    estimator = ArrivalCapacityEstimator(alpha=1.0, robust_window_s=1.0)
+    # This test isolates the rolling-median invariant; startup recovery is
+    # covered separately below.
+    estimator = ArrivalCapacityEstimator(
+        alpha=1.0,
+        robust_window_s=1.0,
+        recovery_samples=1,
+        recovery_window_s=0.0,
+    )
     estimator.observe(0.0, sequence_id=1, packet_size_bytes=1000)
     timestamp = 0.0
     intervals = [0.001, 0.004, 0.002, 0.003, 0.005]
@@ -83,8 +90,8 @@ def test_stale_gap_and_recovery_state():
     assert boundary["skip_reason"] == "stale_boundary"
     assert boundary["filtered_ewma_interarrival"] is None
 
-    # Five compressed adjacent samples alone are insufficient because they do
-    # not span the configured causal recovery window.
+    # Five adjacent samples inside the configured causal window satisfy the
+    # count-based recovery rule.
     last = None
     for sequence in range(4, 9):
         last = estimator.observe(
@@ -92,8 +99,9 @@ def test_stale_gap_and_recovery_state():
             sequence_id=sequence,
             packet_size_bytes=1000,
         )
-    assert not last["estimate_fresh"]
-    assert last["filtered_ewma_interarrival"] is None
+    assert last["estimate_fresh"]
+    assert last["filter_reason"] == "recovery_seeded"
+    close(last["filtered_ewma_interarrival"], 0.0001)
 
     # A gap resets both count and buffered recovery samples.
     gap = estimator.observe(1.105, sequence_id=10, packet_size_bytes=1000)

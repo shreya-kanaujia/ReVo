@@ -86,9 +86,15 @@ def main():
         recovery_window_s=0.02,
     )
     freshness.observe(40.000, sequence_id=1, packet_size_bytes=1000)
-    live = freshness.observe(40.010, sequence_id=2, packet_size_bytes=1000)
+    startup_one = freshness.observe(
+        40.010, sequence_id=2, packet_size_bytes=1000
+    )
+    if startup_one["estimate_fresh"]:
+        raise AssertionError("startup must not publish from one spacing sample")
+    freshness.observe(40.020, sequence_id=3, packet_size_bytes=1000)
+    live = freshness.observe(40.030, sequence_id=4, packet_size_bytes=1000)
     if not live["estimate_fresh"]:
-        raise AssertionError("normal contiguous update should be fresh")
+        raise AssertionError("startup should publish after configured evidence")
     raw_before_stale = live["ewma_interarrival"]
     stale = freshness.snapshot(40.200, packet_size_bytes=1000)
     if stale["estimate_fresh"] or stale["published_ewma_interarrival"] is not None:
@@ -99,31 +105,31 @@ def main():
     )
 
     stale_boundary = freshness.observe(
-        40.200, sequence_id=3, packet_size_bytes=1000
+        40.200, sequence_id=5, packet_size_bytes=1000
     )
     if stale_boundary["filter_reason"] != "stale_boundary_excluded":
         raise AssertionError("first post-stale spacing must remain raw-only")
     if stale_boundary["estimate_fresh"]:
         raise AssertionError("one post-stale sample must not republish")
-    for seq, timestamp in ((4, 40.210), (5, 40.220)):
+    for seq, timestamp in ((6, 40.210), (7, 40.220)):
         recovering = freshness.observe(
             timestamp, sequence_id=seq, packet_size_bytes=1000
         )
         if recovering["estimate_fresh"]:
             raise AssertionError("recovery must require configured adjacency")
     recovered = freshness.observe(
-        40.230, sequence_id=6, packet_size_bytes=1000
+        40.230, sequence_id=8, packet_size_bytes=1000
     )
     if not recovered["estimate_fresh"]:
         raise AssertionError("estimate should resume after adjacent recovery samples")
 
     recovery_gap = freshness.observe(
-        40.250, sequence_id=8, packet_size_bytes=1000
+        40.250, sequence_id=10, packet_size_bytes=1000
     )
     if recovery_gap["corrected_interarrival"] is not None:
         raise AssertionError("recovery sequence gap must remain excluded")
     resumed_after_gap = freshness.observe(
-        40.260, sequence_id=9, packet_size_bytes=1000
+        40.260, sequence_id=11, packet_size_bytes=1000
     )
     if resumed_after_gap["corrected_interarrival"] is None:
         raise AssertionError("adjacent sample after a gap must update normally")
@@ -152,6 +158,71 @@ def main():
     )
     if drained["corrected_interarrival"] is not None:
         raise AssertionError("a genuinely drained sender pause must be excluded")
+    if drained["estimate_recovering"]:
+        raise AssertionError("normal drained frame boundary must not enter recovery")
+
+    frame_rate = ArrivalCapacityEstimator(
+        alpha=0.2,
+        robust_window_s=0.1,
+        freshness_multiplier=3.0,
+        freshness_min_s=0.01,
+        freshness_max_s=0.5,
+        recovery_samples=3,
+        recovery_window_s=0.1,
+    )
+    seq = 1
+    frame_rate.observe(70.0, sequence_id=seq, packet_size_bytes=1000)
+    fresh_frames = []
+    for frame in range(8):
+        base = 70.0 + frame * 0.04
+        if frame:
+            seq += 1
+            boundary = frame_rate.observe(
+                base, sender_grace_period=0.03,
+                sequence_id=seq, packet_size_bytes=1000,
+            )
+            if boundary["estimate_recovering"]:
+                raise AssertionError("25 fps idle boundary reset recovery")
+        for offset in (0.001, 0.002, 0.003):
+            seq += 1
+            sample = frame_rate.observe(
+                base + offset, sequence_id=seq, packet_size_bytes=1000
+            )
+        fresh_frames.append(sample["estimate_fresh"])
+    if not all(fresh_frames):
+        raise AssertionError("repeated 25 fps bursts must remain publishable")
+    between_frames = frame_rate.snapshot(70.0 + 7 * 0.04 + 0.035)
+    if not between_frames["estimate_fresh"]:
+        raise AssertionError("freshness must span the 25 fps controller cadence")
+    expired = frame_rate.snapshot(71.0)
+    if not expired["estimate_stale"] or expired["estimate_fresh"]:
+        raise AssertionError("genuine long confirmation gap must become stale")
+
+    reordered = ArrivalCapacityEstimator(
+        alpha=1.0, recovery_samples=2, recovery_window_s=0.1
+    )
+    reordered.observe(80.000, sequence_id=1, packet_size_bytes=1000)
+    reordered.observe(80.001, sequence_id=2, packet_size_bytes=1000)
+    reordered.observe(80.002, sequence_id=3, packet_size_bytes=1000)
+    jump = reordered.observe(80.003, sequence_id=5, packet_size_bytes=1000)
+    if jump["estimate_state_reason"] != "sequence_gap":
+        raise AssertionError("real forward gap must enter recovery")
+    late = reordered.observe(80.004, sequence_id=4, packet_size_bytes=1000)
+    if late["skip_reason"] != "reordered_message":
+        raise AssertionError("late cross-channel message must be classified")
+    boundary = reordered.observe(80.005, sequence_id=6, packet_size_bytes=1000)
+    if boundary["skip_reason"] != "reorder_boundary":
+        raise AssertionError("post-reorder physical boundary must be excluded")
+    first_recovery = reordered.observe(
+        80.006, sequence_id=7, packet_size_bytes=1000
+    )
+    second_recovery = reordered.observe(
+        80.007, sequence_id=8, packet_size_bytes=1000
+    )
+    if first_recovery["estimate_fresh"] or not second_recovery["estimate_fresh"]:
+        raise AssertionError("reorder must not repeatedly reset recovery")
+    if reordered._recovery_count != len(reordered._service_samples):
+        raise AssertionError("recovery count must match active-window samples")
 
     robust = ArrivalCapacityEstimator(
         alpha=1.0,

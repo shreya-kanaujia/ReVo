@@ -211,8 +211,8 @@ Trace files are whitespace-separated with columns:
 <timestamp_s>  <bandwidth_mbps>  <rtt_ms>  <loss_0_to_1>
 ```
 
-RTT is fixed at 40 ms in the current setup; only bandwidth and loss columns are
-applied via Linux `tc` / `netem`.  `run_sender_eval.py` requires `sudo` for
+RTT/delay is fixed at 0 ms; only bandwidth and loss columns are applied via
+Linux `tc` / `netem`.  `run_sender_eval.py` requires `sudo` for
 the `tc` commands.
 
 ---

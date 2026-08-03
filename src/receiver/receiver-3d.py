@@ -53,12 +53,31 @@ from capacity_feedback import (
     MSG_CAPACITY_FEEDBACK,
     encode_capacity_feedback,
 )
+from receiver_health_feedback import encode_receiver_health
+from probe_feedback import (
+    MSG_CAPACITY_PROBE,
+    ProbeAck,
+    decode_probe_data,
+    encode_probe_ack,
+)
+from receiver.receiver_health import (
+    ReceiverHealthTracker,
+    lacks_required_reference,
+)
+from receiver.media_timing import (
+    FrameDeadlinePolicy,
+    MediaTimingCSV,
+    ready_before_deadline,
+)
+from receiver.streaming_video_writer import StreamingVideoPairWriter
 from webrtc_diagnostics import (
+    SctpEventDiagnostics,
     WebRTCDiagnostics,
     apply_ice_consent_timeout,
     apply_sctp_gap_rtt_fix,
     enable_ice_debug_logging,
     sctp_diagnostic_snapshot,
+    process_resource_snapshot,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -173,7 +192,8 @@ class Receiver():
         # Every frame fid has a display deadline:
         #   deadline(fid) = clock_t0 + (fid + 1) * T
         self.T             = 1.0 / float(self.fps)   # seconds per frame
-        self.p_slack       = 0.010                   # safety margin (s)
+        self.p_slack       = float(getattr(args, "receiver_decode_guard_s", 0.010))
+        self.deadline_policy = FrameDeadlinePolicy(self.T, self.p_slack)
         self.clock_started = False
         self.clock_t0      = 0.0
         self.clock_fid0    = 0
@@ -201,6 +221,8 @@ class Receiver():
         # Ordered lists of frames written to disk (same order as display)
         self.saved_frames       = []
         self.saved_frames_depth = []
+        self.streaming_output = bool(args.streaming_validation_output)
+        self.streaming_writer = None
 
         # ── Counters / metrics ───────────────────────────────────────────────
         self.total_bytes_received       = 0
@@ -213,6 +235,14 @@ class Receiver():
         self.total_frames               = 0
         self.lost_frames_full           = 0     # no chunks arrived at all
         self.lost_frames_partial        = 0     # DESC arrived but some chunks missing
+        self.health_tracker = ReceiverHealthTracker(
+            window_frames=args.receiver_health_window_frames
+        )
+        self.media_timing = MediaTimingCSV(
+            getattr(args, "receiver_media_timing_csv", "")
+        )
+        self.feedback_channel = None
+        self.loop = None
 
         # ── GOP / P-frame continuity ─────────────────────────────────────────
         # Tracks which I-frame the decoder last successfully decoded.
@@ -252,6 +282,7 @@ class Receiver():
             recovery_samples=args.estimator_recovery_samples,
             recovery_window_s=args.estimator_recovery_window_s,
         )
+        self.capacity_feedback_sequence = 0
         self.receiver_capacity_csv_path = args.receiver_capacity_csv
         self.receiver_capacity_file = None
         self.receiver_capacity_writer = None
@@ -259,7 +290,10 @@ class Receiver():
         if args.diagnostic_ice:
             enable_ice_debug_logging()
         self.diagnostics = WebRTCDiagnostics(args.diagnostic_csv, "receiver")
+        self.sctp_events = SctpEventDiagnostics(args.sctp_event_csv, "receiver")
         self.diagnostic_channels = {}
+        self._fatal_error = None
+        self._active_ws = None
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -268,6 +302,27 @@ class Receiver():
     def _is_iframe(self, fid: int) -> bool:
         """Return True if fid is an intra (I) frame position in the GOP."""
         return (fid % int(self.codec.intra_period) == 0)
+
+    def _record_fatal_error(self, context, error):
+        """Preserve the first asynchronous/thread failure for process exit."""
+        if self._fatal_error is None:
+            self._fatal_error = RuntimeError(f"{context}: {error}")
+        self.stop_threads.set()
+        with self.fc_cv:
+            self.fc_cv.notify_all()
+        with self.display_cv:
+            self.display_cv.notify_all()
+
+    def _worker_entry(self, name, target):
+        try:
+            target()
+        except BaseException as error:
+            logging.exception("[Receiver] %s worker failed", name)
+            self._record_fatal_error(f"{name} worker failed", error)
+            if self.loop is not None and self._active_ws is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._active_ws.close(), self.loop
+                )
 
     def init_frame_content(self, fid):
         """
@@ -303,6 +358,10 @@ class Receiver():
             "missing_depth":    0,
             "shard_len_depth":  None,
             "recv_count_depth": 0,
+            # Causal frame timing evidence.
+            "first_chunk_arrival": None,
+            "last_chunk_arrival": None,
+            "fec_ready_timestamp": None,
         }
 
     def _deadline_time(self, fid: int, caller=None) -> float:
@@ -311,6 +370,10 @@ class Receiver():
         deadline(fid) = clock_t0 + (fid + 1) * T
         """
         return self.clock_t0 + (fid + 1) * self.T
+
+    def _assembly_deadline(self, fid: int) -> float:
+        """Guarded assembly deadline for the current frame."""
+        return self.deadline_policy.assembly_deadline(self.clock_t0, fid)
 
     def _open_receiver_capacity_log(self):
         if not self.receiver_capacity_csv_path:
@@ -324,6 +387,7 @@ class Receiver():
             self.receiver_capacity_file,
             fieldnames=[
                 "receiver_timestamp",
+                "feedback_sequence_id",
                 "sequence_id",
                 "packet_size_bytes",
                 "raw_interarrival_time",
@@ -334,10 +398,17 @@ class Receiver():
                 "filtered_smoothed_tau",
                 "filtered_estimated_capacity_mbps",
                 "published_estimated_capacity_mbps",
+                "raw_update_age_s",
+                "published_estimate_age_s",
                 "estimate_age_s",
                 "estimate_fresh",
+                "estimate_stale",
+                "estimate_recovering",
+                "estimate_unavailable",
+                "estimate_state_reason",
                 "freshness_threshold_s",
                 "last_valid_update_timestamp",
+                "last_published_estimate_timestamp",
                 "skip_reason",
                 "filter_reason",
                 "feedback_sent",
@@ -359,7 +430,10 @@ class Receiver():
             sequence_id=seq_id,
             packet_size_bytes=packet_size,
         )
+        self.capacity_feedback_sequence += 1
+        feedback_sequence_id = self.capacity_feedback_sequence
         feedback = encode_capacity_feedback({
+            "feedback_sequence_id": feedback_sequence_id,
             "seq_id": seq_id,
             "packet_size": packet_size,
             "receiver_ts": receiver_ts,
@@ -393,6 +467,7 @@ class Receiver():
                 return "" if value is None else f"{float(value):.9f}"
             self.receiver_capacity_writer.writerow({
                 "receiver_timestamp": f"{float(receiver_ts):.9f}",
+                "feedback_sequence_id": feedback_sequence_id,
                 "sequence_id": int(seq_id),
                 "packet_size_bytes": int(packet_size),
                 "raw_interarrival_time": format_optional(sample["raw_interarrival"]),
@@ -409,19 +484,52 @@ class Receiver():
                 "published_estimated_capacity_mbps": format_optional(
                     published_capacity_mbps
                 ),
+                "raw_update_age_s": format_optional(
+                    sample["raw_update_age_s"]
+                ),
+                "published_estimate_age_s": format_optional(
+                    sample["published_estimate_age_s"]
+                ),
                 "estimate_age_s": format_optional(sample["estimate_age_s"]),
                 "estimate_fresh": "1" if sample["estimate_fresh"] else "0",
+                "estimate_stale": "1" if sample["estimate_stale"] else "0",
+                "estimate_recovering": (
+                    "1" if sample["estimate_recovering"] else "0"
+                ),
+                "estimate_unavailable": (
+                    "1" if sample["estimate_unavailable"] else "0"
+                ),
+                "estimate_state_reason": sample["estimate_state_reason"],
                 "freshness_threshold_s": format_optional(
                     sample["freshness_threshold_s"]
                 ),
                 "last_valid_update_timestamp": format_optional(
                     sample["last_valid_update_ts"]
                 ),
+                "last_published_estimate_timestamp": format_optional(
+                    sample["last_published_estimate_ts"]
+                ),
                 "skip_reason": sample["skip_reason"],
                 "filter_reason": sample["filter_reason"],
                 "feedback_sent": "1" if feedback_sent else "0",
             })
             self.receiver_capacity_file.flush()
+
+    def _schedule_health_feedback(self, feedback):
+        """Send display-clock health from the asyncio loop, never the worker thread."""
+        if feedback is None or self.feedback_channel is None or self.loop is None:
+            return
+        payload = encode_receiver_health(feedback)
+
+        def send():
+            if self.feedback_channel is None:
+                return
+            try:
+                self.feedback_channel.send(payload)
+            except Exception:
+                logging.debug("[Receiver] health feedback send failed", exc_info=True)
+
+        self.loop.call_soon_threadsafe(send)
 
     # ────────────────────────────────────────────────────────────────────────
     # Best-effort payload builder (P-frames with missing chunks)
@@ -505,28 +613,31 @@ class Receiver():
         print(f"{RED}Decode worker thread start{RESET}")
         while not self.stop_threads.is_set():
             fid    = int(self.expected_frame)
+            partial_frame = False
             with self.fc_cv:
                 fc = self.frame_content.get(fid)
             is_key = bool(fc.get("is_key")) if fc else self._is_iframe(fid)
 
-            # Deadline for this frame = display time of the previous frame
-            deadline = self._deadline_time(fid - 1, "decode")
+            # Assembly is allowed until the current frame's display deadline,
+            # less an explicit decode guard. The previous-frame deadline made
+            # every frame one period late by construction.
+            display_deadline = self._deadline_time(fid, "display")
+            deadline = self._assembly_deadline(fid)
             if not self.clock_started:
                 deadline = 9999999999  # block indefinitely until first I-frame arrives
+                display_deadline = 9999999999
 
             # ── Wait for full assembly or deadline ───────────────────────────
             while True:
                 now = time.perf_counter()
-                if now >= deadline:
-                    break
 
                 with self.fc_cv:
                     fc         = self.frame_content.get(fid)
-                    full_ready = False
+                    structurally_ready = False
                     if fc is not None:
                         if is_key:
                             # I-frame: ready as soon as k shards received (FEC can reconstruct)
-                            full_ready = (
+                            structurally_ready = (
                                 fc.get("k_data") is not None and
                                 fc.get("recv_count", 0) >= int(fc["k_data"]) and
                                 fc.get("k_data_depth") is not None and
@@ -534,10 +645,16 @@ class Receiver():
                             )
                         else:
                             # P-frame: all chunks must arrive (no FEC on P-frames)
-                            full_ready = (
+                            structurally_ready = (
                                 fc.get("num_chunks") > 0 and fc.get("missing") == 0 and
                                 fc.get("num_chunks_depth") > 0 and fc.get("missing_depth") == 0
                             )
+                    full_ready = structurally_ready and (
+                        not self.clock_started
+                        or ready_before_deadline(
+                            fc.get("fec_ready_timestamp"), deadline
+                        )
+                    )
 
                     if full_ready:
                         # Start the deadline clock on the very first decoded I-frame
@@ -550,6 +667,9 @@ class Receiver():
                             self.display_next_fid = fid
                         break
 
+                    if now >= deadline:
+                        break
+
                     # Sleep briefly; wake early if a new packet arrives via fc_cv.notify
                     timeout = max(0.0, min(0.01, deadline - now))
                     self.fc_cv.wait(timeout=timeout)
@@ -560,23 +680,38 @@ class Receiver():
                 full_ready = False
                 if fc is not None:
                     if is_key:
-                        full_ready = (
+                        structurally_ready = (
                             fc.get("k_data") is not None and
                             fc.get("recv_count", 0) >= int(fc["k_data"]) and
                             fc.get("k_data_depth") is not None and
                             fc.get("recv_count_depth", 0) >= int(fc["k_data_depth"])
                         )
                     else:
-                        full_ready = (
+                        structurally_ready = (
                             fc.get("num_chunks") > 0 and fc.get("missing") == 0 and
                             fc.get("num_chunks_depth") > 0 and fc.get("missing_depth") == 0
                         )
+                    full_ready = structurally_ready and (
+                        not self.clock_started
+                        or ready_before_deadline(
+                            fc.get("fec_ready_timestamp"), deadline
+                        )
+                    )
 
                 payload       = None
                 payload_depth = None
                 gop_id  = int(fc.get("gop_id", -1))      if fc else -1
                 qp      = int(fc.get("qp",      self.codec.qp_p))       if fc else int(self.codec.qp_p)
                 qp_depth= int(fc.get("qp_depth", self.depth_codec.qp_p)) if fc else int(self.depth_codec.qp_p)
+                first_chunk_arrival = (
+                    fc.get("first_chunk_arrival") if fc else None
+                )
+                last_chunk_arrival = (
+                    fc.get("last_chunk_arrival") if fc else None
+                )
+                fec_ready_timestamp = (
+                    fc.get("fec_ready_timestamp") if fc else None
+                )
 
                 if fc is None:
                     logging.warning(f"{RED}[FID: {fid}] content is None. Nothing arrived within time!{RESET}")
@@ -625,6 +760,7 @@ class Receiver():
                         else:
                             logging.warning(f"{RED}[FID: {fid}] Built best-effort payload for P-frame{RESET}")
                             self.lost_frames_partial += 1
+                            partial_frame = True
 
                 # Release the assembly slot; we no longer need the raw chunks
                 self.done_fids.add(fid)
@@ -633,17 +769,64 @@ class Receiver():
             # ── Decode ───────────────────────────────────────────────────────
             frame_rgb   = None
             frame_depth = None
+            reference_unavailable = False
+            codec_decode_attempted = False
+            decode_start = time.perf_counter()
             if payload is not None and payload_depth is not None:
-                if (not is_key) and (self.last_decode_i_frame_id is not None) and (gop_id != self.last_decode_i_frame_id):
-                    # P-frame belongs to an expired GOP; skip to avoid visual corruption
+                if lacks_required_reference(
+                    is_keyframe=is_key,
+                    gop_id=gop_id,
+                    last_decoded_keyframe_id=self.last_decode_i_frame_id,
+                ):
+                    # The media arrived, but its codec reference chain is not
+                    # available. Keep this distinct from a codec invocation
+                    # that fails to decode validly assembled input.
+                    reference_unavailable = True
                     self.lost_frames_full += 1
                 else:
+                    codec_decode_attempted = True
                     frame_rgb   = self._decode_frame_sync(fid, FRAME_TYPE_RGB,   is_key, qp,       payload)
                     frame_depth = self._decode_frame_sync(fid, FRAME_TYPE_DEPTH, is_key, qp_depth, payload_depth)
                     with self.fc_lock:
                         if frame_rgb is not None and frame_depth is not None and is_key:
                             # Record successful I-frame so future P-frames can verify GOP membership
                             self.last_decode_i_frame_id = fid
+            decode_end = time.perf_counter()
+
+            self.health_tracker.record(
+                fid,
+                full_miss=(payload is None or payload_depth is None),
+                partial=partial_frame,
+                decode_failure=(
+                    codec_decode_attempted
+                    and (frame_rgb is None or frame_depth is None)
+                ),
+                reference_unavailable=reference_unavailable,
+                finalized=True,
+            )
+            self.media_timing.write(
+                timestamp_monotonic=decode_end,
+                event="assembly_decode",
+                frame_id=fid,
+                gop_id=gop_id,
+                is_keyframe=int(is_key),
+                first_chunk_arrival=first_chunk_arrival,
+                last_chunk_arrival=last_chunk_arrival,
+                fec_ready_timestamp=fec_ready_timestamp,
+                assembly_deadline=deadline,
+                display_deadline=display_deadline,
+                decode_guard_s=self.p_slack,
+                assembly_ready=int(full_ready),
+                assembly_reason=(
+                    "ready"
+                    if full_ready
+                    else "deadline_expired"
+                    if fc is not None
+                    else "no_media"
+                ),
+                decode_start=decode_start,
+                decode_end=decode_end,
+            )
 
             # ── Publish decoded frames to display thread ─────────────────────
             with self.display_cv:
@@ -787,6 +970,7 @@ class Receiver():
         """
         with self.display_lock:
             frame_rgb, frame_depth = self.display_buf.pop(fid, (None, None))
+        frozen = frame_rgb is None or frame_depth is None
 
         if frame_rgb is None and frame_depth is None:
             # Frame lost or not decoded in time – freeze on last good frame
@@ -801,8 +985,34 @@ class Receiver():
             self.last_displayed_frame       = frame_rgb
             self.last_displayed_frame_depth = frame_depth
 
-        self.saved_frames.append(frame_rgb)
-        self.saved_frames_depth.append(frame_depth)
+        if self.streaming_output:
+            if self.streaming_writer is None:
+                self.streaming_writer = StreamingVideoPairWriter(
+                    self.media_file,
+                    self.media_file_depth,
+                    fps=self.fps,
+                    intra_period=self.codec.intra_period,
+                )
+            self.streaming_writer.append(frame_rgb, frame_depth)
+        else:
+            self.saved_frames.append(frame_rgb)
+            self.saved_frames_depth.append(frame_depth)
+        display_timestamp = time.perf_counter()
+        self.media_timing.write(
+            timestamp_monotonic=display_timestamp,
+            event="display",
+            frame_id=fid,
+            gop_id=fid - (fid % int(self.codec.intra_period)),
+            is_keyframe=int(self._is_iframe(fid)),
+            display_deadline=self._deadline_time(fid, "display"),
+            decode_guard_s=self.p_slack,
+            display_timestamp=display_timestamp,
+            frozen_display=int(frozen),
+        )
+        feedback = self.health_tracker.complete_display_frame(
+            fid, display_timestamp, frozen=frozen
+        )
+        self._schedule_health_feedback(feedback)
 
     # ────────────────────────────────────────────────────────────────────────
     # Main async entry point
@@ -815,6 +1025,7 @@ class Receiver():
         """
         self.cfg = RTCConfiguration([RTCIceServer(urls=[self.stun_url])])
         self.pc  = RTCPeerConnection(configuration=self.cfg)
+        self.loop = asyncio.get_running_loop()
         self.diagnostics.start(lambda: {
             "rgb_buffered_amount": int(self.diagnostic_channels["rgb_payload"].bufferedAmount)
             if "rgb_payload" in self.diagnostic_channels else "",
@@ -825,19 +1036,35 @@ class Receiver():
             "connection_state": self.pc.connectionState,
             "ice_state": self.pc.iceConnectionState,
             **self.capacity_estimator.snapshot(time.perf_counter()),
+            **process_resource_snapshot(),
             **sctp_diagnostic_snapshot(self.pc),
         })
 
         # Start background worker threads
         self.stop_threads.clear()
-        self.decode_thread  = threading.Thread(target=self._decode_worker_thread,  daemon=True)
-        self.display_thread = threading.Thread(target=self._display_worker_thread, daemon=True)
+        self.decode_thread = threading.Thread(
+            target=self._worker_entry,
+            args=("decode", self._decode_worker_thread),
+            daemon=True,
+        )
+        self.display_thread = threading.Thread(
+            target=self._worker_entry,
+            args=("display", self._display_worker_thread),
+            daemon=True,
+        )
         self.decode_thread.start()
         self.display_thread.start()
 
         @self.pc.on("connectionstatechange")
         async def on_state_change():
             logging.info(f"[Receiver] Connection state: {self.pc.connectionState}")
+            if self.pc.connectionState == "failed":
+                self._record_fatal_error(
+                    "WebRTC connection failed",
+                    RuntimeError("peer connection entered failed state"),
+                )
+                if self._active_ws is not None:
+                    await self._active_ws.close()
 
         @self.pc.on("iceconnectionstatechange")
         async def on_ice_state_change():
@@ -852,6 +1079,9 @@ class Receiver():
         def on_datachannel(channel):
             logging.info("Receiver: DataChannel %s created", channel.label)
             self.diagnostic_channels[channel.label] = channel
+            self.sctp_events.instrument(self.pc)
+            if channel.label == "rgb_payload":
+                self.feedback_channel = channel
             if (self.validation_sctp_gap_rtt_fix
                     and not self._sctp_gap_rtt_fix_applied):
                 apply_sctp_gap_rtt_fix(self.pc, "Receiver")
@@ -864,6 +1094,22 @@ class Receiver():
                     if isinstance(msg, str):
                         msg = msg.encode("utf-8")
 
+                    # Track B active probes are an explicitly separate traffic
+                    # class. They never enter video assembly or the passive
+                    # active-service estimator.
+                    if msg and msg[0] == MSG_CAPACITY_PROBE:
+                        probe = decode_probe_data(msg)
+                        if probe is None:
+                            return
+                        channel.send(encode_probe_ack(ProbeAck(
+                            probe_id=probe.probe_id,
+                            sequence=probe.sequence,
+                            flags=probe.flags,
+                            receiver_ts=receiver_ts,
+                            confirmed_payload_bytes=probe.payload_bytes,
+                        )))
+                        return
+
                     # ── INIT message: learn stream parameters ────────────────
                     if len(msg) == SZ_INIT and msg[0] == MSG_INIT:
                         _, w, h, fps, chunk_size, chunk_size_depth = struct.unpack(FMT_INIT, msg)
@@ -871,6 +1117,7 @@ class Receiver():
                         self.pic_height       = int(h)
                         self.fps              = int(fps)
                         self.T                = 1.0 / float(self.fps)
+                        self.deadline_policy.configure(self.T, self.p_slack)
                         self.chunk_size       = int(chunk_size)
                         self.chunk_size_depth = int(chunk_size_depth)
                         self.stream_inited    = True
@@ -937,69 +1184,98 @@ class Receiver():
                             return
 
                         # Initialize assembly slot on first chunk for this fid
-                        if fid not in self.frame_content:
-                            self.init_frame_content(fid)
-                        elif fid in self.done_fids:
+                        if fid in self.done_fids:
                             # Redundant packet for an already-completed frame; discard
                             self.fc_cv.notify_all()
                             return
+                        if fid not in self.frame_content:
+                            self.init_frame_content(fid)
 
-                        self.frame_content[fid]["is_key"] = is_key
-                        self.frame_content[fid]["gop_id"] = gop_id
+                        frame_slot = self.frame_content[fid]
+                        frame_slot["is_key"] = is_key
+                        frame_slot["gop_id"] = gop_id
+                        if frame_slot["first_chunk_arrival"] is None:
+                            frame_slot["first_chunk_arrival"] = receiver_ts
+                        frame_slot["last_chunk_arrival"] = receiver_ts
 
                         if frame_type == FRAME_TYPE_RGB:
-                            self.frame_content[fid]["qp"]         = qp
-                            self.frame_content[fid]["num_chunks"]  = num_chunks
-                            self.frame_content[fid]["k_data"]      = k_data
-                            self.frame_content[fid]["total_size"]  = total_size
+                            frame_slot["qp"]         = qp
+                            frame_slot["num_chunks"]  = num_chunks
+                            frame_slot["k_data"]      = k_data
+                            frame_slot["total_size"]  = total_size
 
                             # Lazily initialize the shard list on the first arriving chunk
-                            if isinstance(self.frame_content[fid]["parts"], dict):
-                                self.frame_content[fid]["parts"]   = [None] * num_chunks
-                                self.frame_content[fid]["missing"] = num_chunks
-                                self.frame_content[fid]["recv_count"] = 0
+                            if isinstance(frame_slot["parts"], dict):
+                                frame_slot["parts"]   = [None] * num_chunks
+                                frame_slot["missing"] = num_chunks
+                                frame_slot["recv_count"] = 0
 
-                            if is_key and self.frame_content[fid]["shard_len"] is None:
-                                self.frame_content[fid]["shard_len"] = len(msg[SZ_DESC:])
+                            if is_key and frame_slot["shard_len"] is None:
+                                frame_slot["shard_len"] = len(msg[SZ_DESC:])
 
                             # Store shard (guard against duplicates)
-                            if self.frame_content[fid]["parts"][chunk_idx] is None:
-                                self.frame_content[fid]["parts"][chunk_idx]  = msg[SZ_DESC:]
-                                self.frame_content[fid]["missing"]           -= 1
-                                self.frame_content[fid]["recv_count"]        += 1
+                            if frame_slot["parts"][chunk_idx] is None:
+                                frame_slot["parts"][chunk_idx]  = msg[SZ_DESC:]
+                                frame_slot["missing"]           -= 1
+                                frame_slot["recv_count"]        += 1
 
                         else:  # FRAME_TYPE_DEPTH
-                            self.frame_content[fid]["qp_depth"]          = qp
-                            self.frame_content[fid]["num_chunks_depth"]  = num_chunks
-                            self.frame_content[fid]["k_data_depth"]      = k_data
-                            self.frame_content[fid]["total_size_depth"]  = total_size
+                            frame_slot["qp_depth"]          = qp
+                            frame_slot["num_chunks_depth"]  = num_chunks
+                            frame_slot["k_data_depth"]      = k_data
+                            frame_slot["total_size_depth"]  = total_size
 
-                            if isinstance(self.frame_content[fid]["parts_depth"], dict):
-                                self.frame_content[fid]["parts_depth"]       = [None] * num_chunks
-                                self.frame_content[fid]["missing_depth"]     = num_chunks
-                                self.frame_content[fid]["recv_count_depth"]  = 0
+                            if isinstance(frame_slot["parts_depth"], dict):
+                                frame_slot["parts_depth"]       = [None] * num_chunks
+                                frame_slot["missing_depth"]     = num_chunks
+                                frame_slot["recv_count_depth"]  = 0
 
-                            if is_key and self.frame_content[fid]["shard_len_depth"] is None:
-                                self.frame_content[fid]["shard_len_depth"] = len(msg[SZ_DESC:])
+                            if is_key and frame_slot["shard_len_depth"] is None:
+                                frame_slot["shard_len_depth"] = len(msg[SZ_DESC:])
 
-                            if self.frame_content[fid]["parts_depth"][chunk_idx] is None:
-                                self.frame_content[fid]["parts_depth"][chunk_idx]  = msg[SZ_DESC:]
-                                self.frame_content[fid]["missing_depth"]           -= 1
-                                self.frame_content[fid]["recv_count_depth"]        += 1
+                            if frame_slot["parts_depth"][chunk_idx] is None:
+                                frame_slot["parts_depth"][chunk_idx]  = msg[SZ_DESC:]
+                                frame_slot["missing_depth"]           -= 1
+                                frame_slot["recv_count_depth"]        += 1
 
-                            # Record arrival time of first ever packet to anchor the deadline clock
-                            if self.first_packet_clock is None:
-                                self.first_packet_clock = time.perf_counter()
+                        if self.first_packet_clock is None:
+                            self.first_packet_clock = receiver_ts
+
+                        if frame_slot["fec_ready_timestamp"] is None:
+                            if is_key:
+                                ready = (
+                                    frame_slot.get("k_data") is not None
+                                    and frame_slot.get("recv_count", 0)
+                                    >= int(frame_slot["k_data"])
+                                    and frame_slot.get("k_data_depth") is not None
+                                    and frame_slot.get("recv_count_depth", 0)
+                                    >= int(frame_slot["k_data_depth"])
+                                )
+                            else:
+                                ready = (
+                                    frame_slot.get("num_chunks", 0) > 0
+                                    and frame_slot.get("missing", 0) == 0
+                                    and frame_slot.get("num_chunks_depth", 0) > 0
+                                    and frame_slot.get("missing_depth", 0) == 0
+                                )
+                            if ready:
+                                frame_slot["fec_ready_timestamp"] = receiver_ts
 
                         # Wake the decode thread in case this shard completes the frame
                         self.fc_cv.notify_all()
 
                 except Exception as e:
                     logging.exception(f"[Receiver] error handling message on {channel.label}: {e}")
+                    self._record_fatal_error(
+                        f"message handler failed on {channel.label}", e
+                    )
+                    if self._active_ws is not None:
+                        await self._active_ws.close()
 
         # ── WebSocket signaling loop ─────────────────────────────────────────
         async with ClientSession() as session:
             async with session.ws_connect(self.signalling_server, heartbeat=5) as ws:
+                self._active_ws = ws
                 await ws.send_json({"type": "join", "role": "answer"})
                 logging.info("Connected to signaling server as receiver")
 
@@ -1029,8 +1305,9 @@ class Receiver():
                             logging.info("[Receiver] Received bye — draining remaining frames (100 ms)")
                             await asyncio.sleep(0.1)
                             self.stop_threads.set()
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
                             gc.collect()
                             logging.info("Closing WebSocket and stopping")
                             break
@@ -1058,7 +1335,20 @@ class Receiver():
                 )
 
                 # ── Save video ───────────────────────────────────────────────
-                if len(self.saved_frames) > 0:
+                if self.streaming_output:
+                    if self.display_thread:
+                        self.display_thread.join(timeout=2.0)
+                    if self.streaming_writer is not None:
+                        self.streaming_writer.close()
+                        logging.info(
+                            "Receiver: incrementally saved %d synchronized frames",
+                            self.streaming_writer.frame_count,
+                        )
+                    else:
+                        logging.warning(
+                            "[Receiver] No frames decoded; nothing to write"
+                        )
+                elif len(self.saved_frames) > 0:
                     os.makedirs(os.path.dirname(os.path.abspath(self.media_file)),       exist_ok=True)
                     os.makedirs(os.path.dirname(os.path.abspath(self.media_file_depth)), exist_ok=True)
                     try:
@@ -1069,10 +1359,15 @@ class Receiver():
                             crf=0, preset="veryslow"
                         )
                         logging.info(f"Receiver: saved video to {self.media_file}")
-                    except Exception:
+                    except Exception as error:
                         logging.exception("[Receiver] Failed to write video with PyAV")
+                        self._record_fatal_error("video output failed", error)
                 else:
                     logging.warning("[Receiver] No frames decoded; nothing to write")
+                    self._record_fatal_error(
+                        "video output failed",
+                        RuntimeError("no frames decoded"),
+                    )
 
                 # Wake any blocked threads so they can exit cleanly
                 with self.fc_cv:
@@ -1086,9 +1381,19 @@ class Receiver():
                     self.display_thread.join(timeout=1.0)
 
                 await self.diagnostics.stop()
+                self.sctp_events.close()
                 self._close_receiver_capacity_log()
-                cv2.destroyAllWindows()
+                self.media_timing.close()
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    logging.info(
+                        "[Receiver] OpenCV GUI cleanup unavailable in headless runtime"
+                    )
                 logging.info("[Receiver] Graceful shutdown complete")
+                self._active_ws = None
+                if self._fatal_error is not None:
+                    raise self._fatal_error
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1161,17 +1466,27 @@ if __name__ == "__main__":
     p.add_argument("--estimator_recovery_samples", type=int, default=5,
                    help="Adjacent valid samples required after a stale interval")
     p.add_argument("--estimator_recovery_window_s", type=float, default=0.1,
-                   help="Minimum adjacent-observation span before recovery publication")
+                   help="Causal time window containing adjacent recovery samples")
     p.add_argument("--receiver_capacity_csv", default="",
                    help="Validation only: receiver arrival and estimator sample CSV")
     p.add_argument("--diagnostic_csv", default="",
                    help="Validation only: one-second receiver event-loop/feedback diagnostics")
+    p.add_argument("--sctp_event_csv", default="",
+                   help="Validation only: event-level SCTP receive/SACK/T3 diagnostics")
     p.add_argument("--diagnostic_ice", action="store_true",
                    help="Validation only: timestamp aioice STUN consent traffic")
     p.add_argument("--ice_consent_timeout_s", type=float, default=None,
                    help="Validation only: aioice consent timeout applied after ICE completes")
     p.add_argument("--validation_sctp_gap_rtt_fix", action="store_true",
                    help="Validation only: ignore ambiguous RTT samples from already gap-ACKed SCTP data")
+    p.add_argument("--receiver_health_window_frames", type=int, default=30,
+                   help="Display-clock frames per typed receiver-health window")
+    p.add_argument("--receiver_decode_guard_s", type=float, default=0.010,
+                   help="Decode-time guard reserved before each frame display deadline")
+    p.add_argument("--receiver_media_timing_csv", default="",
+                   help="Validation only: per-frame assembly/decode/display timing CSV")
+    p.add_argument("--streaming_validation_output", action="store_true",
+                   help="Validation only: incrementally write videos to bound receiver memory")
 
     args = p.parse_args()
     r    = Receiver(args)
