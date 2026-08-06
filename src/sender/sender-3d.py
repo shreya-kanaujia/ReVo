@@ -68,13 +68,13 @@ BUFFERED_WATERMARK_HARD = 128 * 1024  # 128 KB
 #                        sender degrades (sender-side congestion)
 #   SALSIFY_MISS_THRESH  receiver-reported deadline-miss rate, in percent,
 #                        above which the sender degrades (loss or lateness)
-SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "0"))
-SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "25"))
+SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "1"))
+SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "30"))
 SALSIFY_RGB_QP_MID  = int(os.environ.get("SALSIFY_RGB_QP_MID", "30"))
-SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "35"))
-SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "25"))
+SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "30"))
+SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "30"))
 SALSIFY_DEPTH_QP_MID = int(os.environ.get("SALSIFY_DEPTH_QP_MID", "30"))
-SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "35"))
+SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "30"))
 SALSIFY_SOFT_FRAC   = float(os.environ.get("SALSIFY_SOFT_FRAC", "0.5"))
 SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "5.0"))
 
@@ -141,6 +141,7 @@ class Sender():
 
         # ── Adaptive-quality state ───────────────────────────────────────────
         self.recv_miss_rate = 0.0  # deadline-miss rate last reported by the receiver (%)
+        self.feedback_seen = False
         self.quality_levels = {"rgb": 1, "depth": 1} #default to mid-level quality (0=hi, 1=mid, 2=lo)
         self.quality_streaks = {"rgb": 0, "depth": 0}
 
@@ -159,16 +160,9 @@ class Sender():
         if args.codec == "h264":
             self.depth_codec = h264.H264VideoCodec(intra_period=30)
 
-        # Each H.265 ladder keeps independent reference chains; the send loop
-        # chooses one RGB and one depth output only at GOP boundaries.
-        self.rgb_codecs = [self.codec]
-        self.depth_codecs = [self.depth_codec]
-        if SALSIFY_MODE and args.codec == "h265":
-             self.rgb_codecs.insert(0, h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_HI))
-             self.rgb_codecs.append(h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_LO))
-
-             self.depth_codecs.insert(0,h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_HI))
-             self.depth_codecs.append(h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_LO))
+        # Keep one active codec per stream and swap its QP only when the sender
+        # has enough feedback to justify a change. This removes the overload from
+        # running three encoders in parallel for every frame.
 
         # ── Byte / frame counters ────────────────────────────────────────────
         self.total_bytes_sent           = 0
@@ -285,6 +279,72 @@ class Sender():
         return chunks, chunk_len
 
     # ────────────────────────────────────────────────────────────────────────
+    # Adaptive quality helpers
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _qp_for_level(self, stream: str, level: int) -> int:
+        if stream == "rgb":
+            if level <= 0:
+                return SALSIFY_RGB_QP_HI
+            if level >= 2:
+                return SALSIFY_RGB_QP_LO
+            return SALSIFY_RGB_QP_MID
+        if level <= 0:
+            return SALSIFY_DEPTH_QP_HI
+        if level >= 2:
+            return SALSIFY_DEPTH_QP_LO
+        return SALSIFY_DEPTH_QP_MID
+
+    def _activate_codec_qp(self, stream: str, level: int) -> None:
+        if not SALSIFY_MODE or self.args.codec != "h265":
+            return
+        qp = self._qp_for_level(stream, level)
+        if stream == "rgb":
+            current_qp = getattr(self.codec, "qp_p", None)
+            if current_qp == qp:
+                return
+            self.codec = h265.H265VideoCodec(intra_period=30, qp=qp)
+        else:
+            current_qp = getattr(self.depth_codec, "qp_p", None)
+            if current_qp == qp:
+                return
+            self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=qp)
+
+    def _maybe_update_quality(self, *, frame_id: int, ba: int, is_key: bool) -> None:
+        if not SALSIFY_MODE or self.args.codec != "h265" or not self.feedback_seen:
+            return
+        if frame_id < 3 or not is_key:
+            return
+
+        pressures = {
+            "rgb": (
+                ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
+                or self.recv_miss_rate > SALSIFY_MISS_THRESH
+            ),
+            "depth": (
+                ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
+                or self.recv_miss_rate > SALSIFY_MISS_THRESH
+            ),
+        }
+        for stream in ("rgb", "depth"):
+            current = self.quality_levels[stream]
+            target = (
+                min(current + 1, 2) if pressures[stream] else max(current - 1, 0)
+            )
+            if target != current:
+                self.quality_streaks[stream] += 1
+                if self.quality_streaks[stream] >= 2:
+                    self.quality_levels[stream] = target
+                    self.quality_streaks[stream] = 0
+            else:
+                self.quality_streaks[stream] = 0
+
+        logging.info(
+            f"[Adaptive] GOP {frame_id}: levels={self.quality_levels} "
+            f"(buffered={ba} B, miss_rate={self.recv_miss_rate:.1f}%)"
+        )
+
+    # ────────────────────────────────────────────────────────────────────────
     # Channel warm-up
     # ────────────────────────────────────────────────────────────────────────
 
@@ -349,21 +409,20 @@ class Sender():
                 raw = decoder[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
                 raw_depth = decoder_depth[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
 
-                # ── Compress every RGB and depth ladder rung concurrently ────
-                encode_tasks = [
-                    asyncio.to_thread(encode, codec, raw, frame_id, fps)
-                    for codec in self.rgb_codecs
-                ]
-                encode_tasks.extend(
-                    asyncio.to_thread(encode, codec, raw_depth, frame_id, fps)
-                    for codec in self.depth_codecs
+                # ── Encode one active quality per stream only. ─────────────────
+                ba_rgb = self.data_channel_rgb.bufferedAmount
+                ba_depth = self.data_channel_depth.bufferedAmount
+                ba = max(ba_rgb, ba_depth)
+                is_key = frame_id == 0 or (30 > 0 and frame_id % 30 == 0)
+                if SALSIFY_MODE and self.args.codec == "h265":
+                    self._maybe_update_quality(frame_id=frame_id, ba=ba, is_key=is_key)
+                    self._activate_codec_qp("rgb", self.quality_levels["rgb"])
+                    self._activate_codec_qp("depth", self.quality_levels["depth"])
+                packet_list, packet_list_depth = await asyncio.gather(
+                    asyncio.to_thread(encode, self.codec, raw, frame_id, fps),
+                    asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps),
                 )
-                encoded_ladders = await asyncio.gather(*encode_tasks)
-                rgb_packet_lists = encoded_ladders[:len(self.rgb_codecs)]
-                depth_packet_lists = encoded_ladders[len(self.rgb_codecs):]
-                packet_list = rgb_packet_lists[0]
-                packet_list_depth = depth_packet_lists[0]
-
+                
                 t_send0 = time.perf_counter()
                 if self.trace_t0_sender is None:
                     self.trace_t0_sender = t_send0
@@ -396,9 +455,6 @@ class Sender():
                     gop_id = self.gop_id
 
                     # ── Back-pressure / quality selection ────────────────────
-                    ba_rgb = self.data_channel_rgb.bufferedAmount
-                    ba_depth = self.data_channel_depth.bufferedAmount
-                    ba = max(ba_rgb, ba_depth)
                     if not SALSIFY_MODE:
                         # BASELINE: drop the frame if either buffer is full.
                         if self.data_channel_rgb.bufferedAmount > BUFFERED_WATERMARK_HARD:
@@ -408,47 +464,13 @@ class Sender():
                             logging.warning(f"[Sender] Depth buffer full — dropping frame {out_fid}")
                             break
                     else:
-                        # Change quality only at I-frames because each ladder rung
-                        # has an independent reference chain.
-                        if is_key:
-                            pressures = {
-                                "rgb": (ba_rgb > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
-                                        or self.recv_miss_rate > SALSIFY_MISS_THRESH),
-                                "depth": (ba_depth > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
-                                          or self.recv_miss_rate > SALSIFY_MISS_THRESH),
-                            }
-                            for stream, codecs in (("rgb", self.rgb_codecs), ("depth", self.depth_codecs)):
-                                current = self.quality_levels[stream]
-                                target = (min(current + 1, len(codecs) - 1)
-                                          if pressures[stream] else max(current - 1, 0))
-                                if target != current:
-                                    self.quality_streaks[stream] += 1
-                                    if self.quality_streaks[stream] >= 2:
-                                        self.quality_levels[stream] = target
-                                        self.quality_streaks[stream] = 0
-                                else:
-                                    self.quality_streaks[stream] = 0
-                            logging.info(
-                                f"[Adaptive] GOP {out_fid}: levels={self.quality_levels} "
-                                f"(buffered={ba} B, miss_rate={self.recv_miss_rate:.1f}%)")
                         if ba > BUFFERED_WATERMARK_HARD:
                             logging.warning(f"[Sender] send buffer full — dropping frame {out_fid}")
                             break
 
-                        rgb_level = self.quality_levels["rgb"]
-                        depth_level = self.quality_levels["depth"]
-                        selected_rgb = next(
-                            (item for item in rgb_packet_lists[rgb_level] if item["frame_id"] == out_fid), None
-                        )
-                        selected_depth = next(
-                            (item for item in depth_packet_lists[depth_level] if item["frame_id"] == out_fid), None
-                        )
-                        if selected_rgb is not None:
-                            payload, qp = selected_rgb["payload"], selected_rgb["qp"]
-                        if selected_depth is not None:
-                            payload_depth, qp_depth = selected_depth["payload"], selected_depth["qp"]
                         logging.info(
-                            f"[Adaptive] frame {out_fid} rgb_qp={qp} depth_qp={qp_depth} buffered={ba} B")
+                            f"[Adaptive] frame {out_fid} rgb_qp={qp} depth_qp={qp_depth} buffered={ba} B"
+                        )
 
                     # ── Chunk / shard preparation ────────────────────────────
                     if is_key:
@@ -697,6 +719,7 @@ class Sender():
                     msg = msg.decode("utf-8")
                 if isinstance(msg, str) and msg.startswith("FB:"):
                     self.recv_miss_rate = float(msg[3:])
+                    self.feedback_seen = True
                     logging.info(f"[Feedback] miss_rate={self.recv_miss_rate:.1f}%")
             except Exception as exc:
                 logging.warning(f"[Feedback] could not parse '{msg}': {exc}")
