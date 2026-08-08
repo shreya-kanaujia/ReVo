@@ -69,12 +69,12 @@ BUFFERED_WATERMARK_HARD = 128 * 1024  # 128 KB
 #   SALSIFY_MISS_THRESH  receiver-reported deadline-miss rate, in percent,
 #                        above which the sender degrades (loss or lateness)
 SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "1"))
-SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "30"))
+SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "25"))
 SALSIFY_RGB_QP_MID  = int(os.environ.get("SALSIFY_RGB_QP_MID", "30"))
-SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "30"))
-SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "30"))
+SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "35"))
+SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "25"))
 SALSIFY_DEPTH_QP_MID = int(os.environ.get("SALSIFY_DEPTH_QP_MID", "30"))
-SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "30"))
+SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "35"))
 SALSIFY_SOFT_FRAC   = float(os.environ.get("SALSIFY_SOFT_FRAC", "0.5"))
 SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "5.0"))
 
@@ -428,7 +428,7 @@ class Sender():
 
                 encode_time = time.perf_counter() - encode_start
                 logging.info(
-                    f"[Timing] frame={frame_id} "
+                    f"\n[Timing] frame={frame_id} "
                     f"encode={encode_time*1000:.1f}ms "
                     f"rgb={len(packet_list[0]['payload'])/1024:.1f}KB "
                     f"depth={len(packet_list_depth[0]['payload'])/1024:.1f}KB "
