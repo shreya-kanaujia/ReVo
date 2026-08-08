@@ -28,6 +28,8 @@ import argparse, asyncio, logging
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiohttp import ClientSession
 import aiohttp
+
+
 from torchcodec.decoders import VideoDecoder
 import torch
 import DCVCRT_wrapper as dcvc
@@ -144,6 +146,8 @@ class Sender():
         self.feedback_seen = False
         self.quality_levels = {"rgb": 1, "depth": 1} #default to mid-level quality (0=hi, 1=mid, 2=lo)
         self.quality_streaks = {"rgb": 0, "depth": 0}
+        self.force_keyframe_pending = False
+        self.last_forced_keyframe_fid = -999
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
@@ -387,8 +391,8 @@ class Sender():
             logging.info(f"[Sender] Starting stream: {len(decoder)} frames @ {fps} FPS")
 
             # Codec wrappers are not async, so run them in a thread pool.
-            def encode(codec, raw_tensor, fid, current_fps):
-                return list(codec.compress_stream(raw_tensor, fid, fps=current_fps))
+            def encode(codec, raw_tensor, fid, current_fps, force_keyframe=False):
+                return list(codec.compress_stream(raw_tensor, fid, fps=current_fps, force_keyframe=force_keyframe))
 
             self._send_init(512, 512, fps)
 
@@ -409,18 +413,26 @@ class Sender():
                 raw = decoder[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
                 raw_depth = decoder_depth[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
 
+                # Check if we should force a keyframe for both streams
+                force_this_frame = False
+                if self.force_keyframe_pending:
+                    force_this_frame = True
+                    self.force_keyframe_pending = False
+                    self.last_forced_keyframe_fid = frame_id
+                    logging.info(f"[Sender] Forcing keyframe for frame {frame_id}!")
+
                 # ── Encode one active quality per stream only. ─────────────────
                 ba_rgb = self.data_channel_rgb.bufferedAmount
                 ba_depth = self.data_channel_depth.bufferedAmount
                 ba = max(ba_rgb, ba_depth)
-                is_key = frame_id == 0 or (30 > 0 and frame_id % 30 == 0)
+                is_key = frame_id == 0 or (30 > 0 and frame_id % 30 == 0) or force_this_frame
                 if SALSIFY_MODE and self.args.codec == "h265":
                     self._maybe_update_quality(frame_id=frame_id, ba=ba, is_key=is_key)
                     self._activate_codec_qp("rgb", self.quality_levels["rgb"])
                     self._activate_codec_qp("depth", self.quality_levels["depth"])
                 packet_list, packet_list_depth = await asyncio.gather(
-                    asyncio.to_thread(encode, self.codec, raw, frame_id, fps),
-                    asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps),
+                    asyncio.to_thread(encode, self.codec, raw, frame_id, fps, force_this_frame),
+                    asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps, force_this_frame),
                 )
                 
                 t_send0 = time.perf_counter()
@@ -679,6 +691,27 @@ class Sender():
     # Main async entry point
     # ────────────────────────────────────────────────────────────────────────
 
+    def _handle_rgb_message(self, msg):
+        try:
+            if isinstance(msg, bytes):
+                msg = msg.decode("utf-8")
+            if isinstance(msg, str):
+                if msg.startswith("FB:"):
+                    self.recv_miss_rate = float(msg[3:])
+                    self.feedback_seen = True
+                    logging.info(f"[Feedback] miss_rate={self.recv_miss_rate:.1f}%")
+                elif msg.startswith("KEYFRAME_REQUEST:"):
+                    requested_fid = int(msg[len("KEYFRAME_REQUEST:"):])
+                    if requested_fid >= 0:
+                        current_fid = getattr(self, "sent_frames", 0)
+                        if current_fid - self.last_forced_keyframe_fid >= 30:
+                            self.force_keyframe_pending = True
+                            logging.info(f"[Feedback] Received KEYFRAME_REQUEST for frame {requested_fid}, current frame {current_fid}. Setting pending force keyframe.")
+                        else:
+                            logging.info(f"[Feedback] Ignored KEYFRAME_REQUEST for frame {requested_fid} due to cooldown (current frame {current_fid}, last forced {self.last_forced_keyframe_fid}).")
+        except Exception as exc:
+            logging.warning(f"[Feedback] could not parse '{msg}': {exc}")
+
     async def run(self):
         """
         Connect to the signaling server, negotiate WebRTC, wait for both
@@ -713,16 +746,7 @@ class Sender():
 
         @self.data_channel_rgb.on("message")
         def on_rgb_message(msg):
-            # Receiver reports its deadline-miss rate as "FB:<percent>".
-            try:
-                if isinstance(msg, bytes):
-                    msg = msg.decode("utf-8")
-                if isinstance(msg, str) and msg.startswith("FB:"):
-                    self.recv_miss_rate = float(msg[3:])
-                    self.feedback_seen = True
-                    logging.info(f"[Feedback] miss_rate={self.recv_miss_rate:.1f}%")
-            except Exception as exc:
-                logging.warning(f"[Feedback] could not parse '{msg}': {exc}")
+            self._handle_rgb_message(msg)
 
         @self.data_channel_rgb.on("close")
         def on_rgb_close():

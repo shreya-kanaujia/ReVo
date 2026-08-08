@@ -230,6 +230,8 @@ class Receiver():
         self.display_thread = None
 
         self._last_chunk_gc = time.perf_counter()
+        self.last_keyframe_request_time = 0.0
+        self.keyframe_request_pending = False
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -237,6 +239,8 @@ class Receiver():
 
     def _is_iframe(self, fid: int) -> bool:
         """Return True if fid is an intra (I) frame position in the GOP."""
+        if self.last_decode_i_frame_id is not None:
+            return (fid - self.last_decode_i_frame_id) % int(self.codec.intra_period) == 0
         return (fid % int(self.codec.intra_period) == 0)
 
     def init_frame_content(self, fid):
@@ -372,6 +376,8 @@ class Receiver():
             deadline = self._deadline_time(fid - 1, "decode")
             if not self.clock_started:
                 deadline = 9999999999  # block indefinitely until first I-frame arrives
+            elif self.keyframe_request_pending:
+                deadline += 0.300
 
             # ── Wait for full assembly or deadline ───────────────────────────
             while True:
@@ -383,6 +389,7 @@ class Receiver():
                     fc         = self.frame_content.get(fid)
                     full_ready = False
                     if fc is not None:
+                        is_key = bool(fc.get("is_key"))
                         if is_key:
                             # I-frame: ready as soon as k shards received (FEC can reconstruct)
                             full_ready = (
@@ -418,6 +425,7 @@ class Receiver():
                 fc         = self.frame_content.get(fid)
                 full_ready = False
                 if fc is not None:
+                    is_key = bool(fc.get("is_key"))
                     if is_key:
                         full_ready = (
                             fc.get("k_data") is not None and
@@ -489,6 +497,21 @@ class Receiver():
                 self.done_fids.add(fid)
                 self.frame_content.pop(fid, None)
 
+                # Loss detection for keyframes: if payload or payload_depth is None and it is a keyframe
+                if is_key and (payload is None or payload_depth is None):
+                    now = time.perf_counter()
+                    if not self.keyframe_request_pending or (now - self.last_keyframe_request_time >= 1.0):
+                        self.last_keyframe_request_time = now
+                        self.keyframe_request_pending = True
+                        if self.feedback_channel is not None and self.loop is not None:
+                            try:
+                                self.loop.call_soon_threadsafe(
+                                    self.feedback_channel.send, f"KEYFRAME_REQUEST:{fid}"
+                                )
+                                logging.info(f"[Recovery] Sent KEYFRAME_REQUEST for lost keyframe {fid}")
+                            except Exception as exc:
+                                logging.warning(f"[Recovery] Failed to send KEYFRAME_REQUEST: {exc}")
+
                 # Report the deadline-miss rate over the frames since the last
                 # report.  The span of frame ids is used as the denominator
                 # rather than a counter of frames seen here: misses are recorded
@@ -524,6 +547,8 @@ class Receiver():
                         if frame_rgb is not None and frame_depth is not None and is_key:
                             # Record successful I-frame so future P-frames can verify GOP membership
                             self.last_decode_i_frame_id = fid
+                            self.keyframe_request_pending = False
+                            logging.info(f"[Recovery] Successfully decoded keyframe {fid}. Cleared pending request state.")
 
             # ── Publish decoded frames to display thread ─────────────────────
             with self.display_cv:
@@ -535,7 +560,7 @@ class Receiver():
             # Corruption propagates forward through the GOP because each P-frame
             # depends on all previous frames.
             gop = int(self.codec.intra_period)
-            if fid % gop == 0:
+            if is_key:
                 # Start of GOP: reset propagation state
                 self._gop_corrupted_active_rgb   = frame_rgb   is None
                 self._gop_corrupted_active_depth = frame_depth is None
@@ -557,7 +582,7 @@ class Receiver():
             # It triggers when a frame is totally lost (payload is None), and
             # propagates for the rest of the GOP since subsequent P-frames can't
             # reference a frame that was never decoded.
-            if fid % gop == 0:
+            if is_key:
                 self._gop_frozen_active_rgb   = frame_rgb   is None
                 self._gop_frozen_active_depth = frame_depth is None
             else:
@@ -745,12 +770,16 @@ class Receiver():
                     (mtype, frame_type, fid, gop_id, qp,
                      chunk_idx, num_chunks, k_data, total_size) = struct.unpack(FMT_DESC, msg[:SZ_DESC])
 
+                    import os
+                    if os.environ.get("REVO_TEST_DROP_KEYFRAME") == "1" and int(fid) == 30:
+                        return  # drop frame 30 for testing recovery
+
                     if mtype != MSG_DESC:
                         return  # unexpected message type
 
                     fid        = int(fid)
-                    is_key     = self._is_iframe(fid)
                     gop_id     = int(gop_id)
+                    is_key     = (gop_id == fid)
                     qp         = int(qp)
                     chunk_idx  = int(chunk_idx)
                     num_chunks = int(num_chunks)

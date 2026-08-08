@@ -58,7 +58,7 @@ class H265VideoCodec:
             "x265-params": (
                 f"qp={qp_stream}:"
                 f"keyint={self.intra_period}:"
-                f"min-keyint={self.intra_period}:"
+                f"min-keyint=1:"
                 "scenecut=0:bframes=0:rc-lookahead=0:no-scenecut=1:frame-threads=1"
             ),
         }
@@ -80,7 +80,7 @@ class H265VideoCodec:
         ctx.open()
         self.dec = ctx
 
-    def compress_stream(self, frames: torch.Tensor, frame_id: int, fps: int = 30):
+    def compress_stream(self, frames: torch.Tensor, frame_id: int, fps: int = 30, force_keyframe: bool = False):
         """
         frames: (1, 1, C, H, W) torch tensor in [0,1] or [0,255], RGB
         Yields at most ONE dict per call, but possibly zero (if encoder is buffering):
@@ -104,6 +104,9 @@ class H265VideoCodec:
         x = x.permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
 
         frame = av.VideoFrame.from_ndarray(x, format="rgb24")
+        if force_keyframe:
+            frame.pict_type = av.video.frame.PictureType.I
+            frame.key_frame = True
 
         # Encode this frame; libx265 may or may not output a packet yet.
         packets = self.enc.encode(frame)
@@ -121,8 +124,7 @@ class H265VideoCodec:
         # The earliest "inflight" frame now gets its payload
         out_id = self._inflight_ids.popleft()
 
-        is_key = (out_id == 0 or
-                  (self.intra_period > 0 and out_id % self.intra_period == 0))
+        is_key = any(p.is_keyframe for p in packets)
         qp = self.qp_i if is_key else self.qp_p
 
         yield {
@@ -159,8 +161,7 @@ class H265VideoCodec:
                 out_id = self._inflight_ids.popleft()
 
             H, W = self.height, self.width
-            is_key = (out_id == 0 or
-                      (self.intra_period > 0 and out_id % self.intra_period == 0))
+            is_key = any(p.is_keyframe for p in packets)
             qp = self.qp_i if is_key else self.qp_p
 
             yield {
