@@ -418,9 +418,22 @@ class Sender():
                     self._maybe_update_quality(frame_id=frame_id, ba=ba, is_key=is_key)
                     self._activate_codec_qp("rgb", self.quality_levels["rgb"])
                     self._activate_codec_qp("depth", self.quality_levels["depth"])
+
+                encode_start = time.perf_counter()
+                
                 packet_list, packet_list_depth = await asyncio.gather(
                     asyncio.to_thread(encode, self.codec, raw, frame_id, fps),
                     asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps),
+                )
+
+                encode_time = time.perf_counter() - encode_start
+                logging.info(
+                    f"[Timing] frame={frame_id} "
+                    f"encode={encode_time*1000:.1f}ms "
+                    f"rgb={len(packet_list[0]['payload'])/1024:.1f}KB "
+                    f"depth={len(packet_list_depth[0]['payload'])/1024:.1f}KB "
+                    f"buffer_rgb={self.data_channel_rgb.bufferedAmount} "
+                    f"buffer_depth={self.data_channel_depth.bufferedAmount}"
                 )
                 
                 t_send0 = time.perf_counter()
