@@ -1,0 +1,45 @@
+FROM python:3.12-slim
+
+# Install system dependencies (build-essential, FFmpeg headers, iproute2 for tc, etc.)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    iproute2 \
+    ffmpeg \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libavfilter-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir torch==2.13.0+cpu torchvision torchcodec==0.15.0+cpu --index-url https://download.pytorch.org/whl/cpu
+
+# Install the other required python packages, utilizing headless opencv for headless environment
+RUN pip install --no-cache-dir \
+    tqdm \
+    scipy \
+    pybind11 \
+    pillow \
+    pandas \
+    matplotlib \
+    pyyaml \
+    torchmetrics \
+    av \
+    aiortc \
+    aiohttp \
+    numpy \
+    opencv-python-headless \
+    zfec \
+    einops \
+    pytorch_msssim \
+    timm
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+
+CMD ["bash"]

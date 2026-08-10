@@ -1,0 +1,36 @@
+services:
+  signaling:
+    image: revo-local-testbed
+    container_name: revo-signaling
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    command: bash -c "python -u src/signalling_server.py > output/signaling.log 2>&1"
+
+  receiver:
+    image: revo-local-testbed
+    container_name: revo-receiver
+    depends_on:
+      - signaling
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: bash -c "sleep 3 && python -u src/receiver/receiver-3d.py --codec h265 --server_ip signaling --out output/receiver_rgb.mp4 --out_depth output/receiver_depth.mp4 > output/receiver.log 2>&1"
+
+  sender:
+    image: revo-local-testbed
+    container_name: revo-sender
+    user: "root"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - signaling
+      - receiver
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SALSIFY_MODE=0
+    command: bash -c "sleep 6; bash scripts/capture_tc_stats.sh eth0 output/tc_stats.log & TC_CAPTURE_PID=$$!; python -u src/sender/sender-3d.py --codec h265 --server_ip signaling --file data/short_rgb.mp4 --depth_file data/short_depth.mp4 --trace_path src/sender/traces/constant_loss_10pct_360s.log --tc_script src/sender/run_loss_trace.py --interface eth0 > output/sender.log 2>&1; SENDER_STATUS=$$?; wait $$TC_CAPTURE_PID; TC_CAPTURE_STATUS=$$?; if [ $$SENDER_STATUS -ne 0 ]; then exit $$SENDER_STATUS; fi; exit $$TC_CAPTURE_STATUS"

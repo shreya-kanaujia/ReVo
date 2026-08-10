@@ -948,7 +948,10 @@ class Receiver():
                 if self.display_thread:
                     self.display_thread.join(timeout=1.0)
 
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass
                 logging.info("[Receiver] Graceful shutdown complete")
 
 

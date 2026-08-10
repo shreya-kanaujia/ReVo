@@ -387,7 +387,34 @@ class Sender():
         try:
             decoder       = VideoDecoder(self.media_file,       device="cpu")
             decoder_depth = VideoDecoder(self.media_file_depth, device="cpu")
-            fps           = FPS_FALLBACK
+            rgb_fps = decoder.metadata.average_fps
+            depth_fps = decoder_depth.metadata.average_fps
+            if rgb_fps is None or depth_fps is None:
+                if rgb_fps is not None or depth_fps is not None:
+                    raise ValueError("RGB and depth FPS metadata must either both be present or both be absent")
+                fps = FPS_FALLBACK
+                logging.warning(f"[Sender] FPS metadata unavailable; using {FPS_FALLBACK} FPS fallback")
+            else:
+                rgb_fps_value = float(rgb_fps)
+                depth_fps_value = float(depth_fps)
+                rgb_init_fps = round(rgb_fps_value)
+                depth_init_fps = round(depth_fps_value)
+                if rgb_init_fps != depth_init_fps:
+                    raise ValueError(
+                        "RGB/depth FPS mismatch after conversion to the integer/u16 INIT protocol: "
+                        f"RGB={rgb_fps_value:g}->{rgb_init_fps}, "
+                        f"depth={depth_fps_value:g}->{depth_init_fps}"
+                    )
+                if not 1 <= rgb_init_fps <= 0xFFFF:
+                    raise ValueError(f"Source FPS {rgb_init_fps} is outside the INIT u16 range")
+                if not math.isclose(rgb_fps_value, rgb_init_fps, rel_tol=0.0, abs_tol=1e-6) \
+                        or not math.isclose(depth_fps_value, depth_init_fps, rel_tol=0.0, abs_tol=1e-6):
+                    logging.warning(
+                        "[Sender] Fractional FPS cannot be represented by INIT u16; "
+                        "using deliberate nearest-integer conversion: "
+                        f"RGB={rgb_fps_value:g}, depth={depth_fps_value:g}, INIT={rgb_init_fps}"
+                    )
+                fps = rgb_init_fps
             logging.info(f"[Sender] Starting stream: {len(decoder)} frames @ {fps} FPS")
 
             # Codec wrappers are not async, so run them in a thread pool.
