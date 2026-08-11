@@ -38,10 +38,13 @@ import math
 import random
 import struct
 from zfec import Encoder
-import os
 import subprocess
-import sys
 import bisect
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.sender.gcc_controller import GCCController
 
 # ANSI color codes for log readability
 RED   = "\033[31m"
@@ -62,6 +65,7 @@ FPS_FALLBACK = 30  # used when the video file has no metadata fps
 # ---------------------------------------------------------------------------
 MSG_INIT         = 1   # one-time stream parameters
 MSG_DESC         = 2   # per-chunk descriptor (precedes every data shard)
+MSG_GCC_FEEDBACK = 5   # loss/delay feedback from receiver
 FRAME_TYPE_RGB   = 3
 FRAME_TYPE_DEPTH = 4
 
@@ -77,9 +81,11 @@ FRAME_TYPE_DEPTH = 4
 #         (raw shard bytes follow immediately after)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIId"
+FMT_GCC_FEEDBACK = "<ff"
 SZ_INIT  = struct.calcsize(FMT_INIT)
 SZ_DESC  = struct.calcsize(FMT_DESC)
+SZ_GCC_FEEDBACK = struct.calcsize(FMT_GCC_FEEDBACK)
 
 
 class Sender():
@@ -115,6 +121,7 @@ class Sender():
         self.pc                = None
         self.data_channel_rgb  = None
         self.data_channel_depth= None
+        self.data_channel_feedback = None
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
@@ -163,6 +170,17 @@ class Sender():
         self.trace_duration    = None
         self.trace_t0_sender   = None  # wall time when first data chunk is sent
 
+        # GCC-based congestion controller state
+        self.gcc_controller = GCCController(initial_rate_bps=4_500_000)
+        self.gcc_seq = 0
+        self.gcc_next_send_time = None
+        self.gcc_last_qp_update_gop = -1
+        self.gcc_prev_gop_bytes = 0
+        self.gcc_gop_bytes = 0
+        self.last_feedback_update = None
+        self.loss_feedback_history = []
+        self.delay_feedback_history = []
+
     # ────────────────────────────────────────────────────────────────────────
     # Network trace (tc qdisc) control
     # ────────────────────────────────────────────────────────────────────────
@@ -209,6 +227,32 @@ class Sender():
     # ────────────────────────────────────────────────────────────────────────
     # Protocol helpers
     # ────────────────────────────────────────────────────────────────────────
+
+    def _apply_gcc_qp(self, target_rate_bps, measured_rate_bps=None):
+        if measured_rate_bps is None or measured_rate_bps <= 0:
+            return
+        ratio = float(measured_rate_bps) / max(float(target_rate_bps), 1.0)
+        if 0.85 <= ratio <= 1.15:
+            return
+
+        # Scaled step: proportional to ratio difference instead of constant +-1
+        delta = int(max(-5, min(5, round(3.0 * (ratio - 1.0)))))
+        if delta == 0:
+            delta = 1 if ratio > 1.15 else -1
+
+        for codec, label in ((self.codec, "RGB"), (self.depth_codec, "depth")):
+            old = getattr(codec, "qp_p", getattr(codec, "qp", None))
+            if old is None:
+                continue
+            new = max(18, min(48, int(old) + delta))
+            for attr in ("qp_p", "qp", "qp_i"):
+                if hasattr(codec, attr):
+                    try:
+                        setattr(codec, attr, new)
+                    except Exception:
+                        pass
+            logging.info("[GCC] %s QP %d -> %d (target=%.3f Mbps, measured=%.3f Mbps)", 
+                        label, old, new, target_rate_bps/1e6, measured_rate_bps/1e6)
 
     def _send_init(self, width: int, height: int, fps: int):
         """Send the one-time INIT message carrying stream parameters."""
@@ -268,6 +312,18 @@ class Sender():
     # Main streaming loop
     # ────────────────────────────────────────────────────────────────────────
 
+    def _update_gcc_from_feedback(self, ar_bps: float, loss_fraction: float):
+        target = self.gcc_controller.update(ar_bps=ar_bps, loss_fraction=loss_fraction)
+        self.loss_feedback_history.append(loss_fraction)
+        self.last_feedback_update = time.monotonic()
+        logging.info(
+            "[GCC] Ar=%.3f Mbps As=%.3f Mbps target=%.3f Mbps loss=%.3f",
+            self.gcc_controller.Ar / 1e6,
+            self.gcc_controller.As / 1e6,
+            target / 1e6,
+            loss_fraction,
+        )
+
     async def stream_video(self):
         """
         Encode and send every frame from the input video files.
@@ -313,21 +369,25 @@ class Sender():
                 raw = decoder[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
                 raw_depth = decoder_depth[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
 
+                # ── GOP-level encoder adaptation ─────────────────────────────
+                if frame_id > 0 and frame_id % 30 == 0:
+                    measured = self.gcc_gop_bytes * 8.0 * fps / 30.0
+                    self._apply_gcc_qp(self.gcc_controller.get_target_rate_bps(), measured)
+                    self.gcc_prev_gop_bytes = self.gcc_gop_bytes
+                    self.gcc_gop_bytes = 0
+
                 # ── Compress RGB and depth concurrently ──────────────────────
+                # In sender-3d.py -> Sender.stream_video
+
+                # Compress RGB and depth concurrently
                 task_rgb   = asyncio.to_thread(encode_rgb,   raw,       frame_id, fps)
                 task_depth = asyncio.to_thread(encode_depth, raw_depth, frame_id, fps)
                 packet_list, packet_list_depth = await asyncio.gather(task_rgb, task_depth)
 
-                t_send0 = time.perf_counter()
+                # FIX: Set frame_send_ts AFTER encoding completes, right before sending packets
+                frame_send_ts = time.perf_counter()
                 if self.trace_t0_sender is None:
-                    self.trace_t0_sender = t_send0
-
-                # ── Compute send budget (time remaining in this frame slot) ──
-                send_budget   = frame_interval
-                frame_deadline = None
-                if frame_id > 0:
-                    frame_deadline = t0 + frame_interval * frame_id
-                    send_budget    = max(0.0, frame_deadline - t_send0)
+                    self.trace_t0_sender = frame_send_ts
 
                 # ── Extract compressed outputs ───────────────────────────────
                 for out in packet_list:
@@ -339,6 +399,7 @@ class Sender():
                     out_depth     = packet_list_depth[0]
                     payload_depth = out_depth["payload"]
                     qp_depth      = out_depth["qp"]
+                    self.gcc_gop_bytes += len(payload) + len(payload_depth)
 
                     # Update GOP id on I-frame so receiver can drop stale P-frames
                     if is_key:
@@ -374,8 +435,10 @@ class Sender():
                         num_chunks_depth = max(1, (len(payload_depth) + self.chunk_size_depth - 1) // self.chunk_size_depth)
                         k_data_depth     = num_chunks_depth
 
-                    # Distribute the frame's send budget evenly across all packets
-                    per_pkt_dt = send_budget / (num_chunks + num_chunks_depth)
+                    # GCC is a pacer, not a frame-dropper. Every encoded frame is
+                    # sent completely; packets are serialized according to the current
+                    # aggregate GCC target rate. This avoids the previous bug where the
+                    # first interleaving phase ignored bytes_budget entirely.
 
                     # ── Send chunks ──────────────────────────────────────────
                     # Interleave RGB and depth chunks so burst loss affects
@@ -394,22 +457,27 @@ class Sender():
                         return struct.pack(
                             FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
                             int(out_fid), int(gop_id), int(qp),
-                            int(chunk_idx), int(num_chunks), int(k_data), int(len(payload))
+                            int(chunk_idx), int(num_chunks), int(k_data),
+                            int(len(payload)), int(self.gcc_seq), float(frame_send_ts)
                         )
 
                     def _build_depth_hdr():
                         return struct.pack(
                             FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
                             int(out_fid), int(gop_id), int(qp_depth),
-                            int(chunk_idx_depth), int(num_chunks_depth), int(k_data_depth), int(len(payload_depth))
+                            int(chunk_idx_depth), int(num_chunks_depth), int(k_data_depth),
+                            int(len(payload_depth)), int(self.gcc_seq), float(frame_send_ts)
                         )
 
-                    async def _pace():
-                        """Sleep until the next pacing slot."""
-                        nonlocal idx
-                        target_t = t_send0 + per_pkt_dt * (idx + 1)
-                        idx += 1
-                        await asyncio.sleep(max(0.0, target_t - time.perf_counter()))
+                    async def _pace(packet_len):
+                        """Global aggregate GCC pacer. The two media channels share one rate."""
+                        now = time.perf_counter()
+                        rate = max(100_000.0, self.gcc_controller.get_target_rate_bps())
+                        if self.gcc_next_send_time is None:
+                            self.gcc_next_send_time = now
+                        self.gcc_next_send_time = max(self.gcc_next_send_time, now)
+                        self.gcc_next_send_time += (len(packet_len) * 8.0) / rate if isinstance(packet_len, (bytes, bytearray)) else (float(packet_len) * 8.0) / rate
+                        await asyncio.sleep(max(0.0, self.gcc_next_send_time - time.perf_counter()))
 
                     # Phase 1: interleaved RGB + depth (while both streams still have chunks)
                     while chunk_idx < num_chunks and chunk_idx_depth < num_chunks_depth:
@@ -422,6 +490,7 @@ class Sender():
                         if chunk_idx == 0 and not is_key:
                             first_rgb_packet = packet
                         self.data_channel_rgb.send(packet)
+                        self.gcc_seq += 1
                         logging.debug(f"rgb  frame {out_fid} chunk {chunk_idx} sent")
                         self.reliable_bytes_meta += len(hdr)
                         if is_key:
@@ -434,7 +503,7 @@ class Sender():
                             self.p_bytes_sent += len(packet)
                         self.total_bytes_sent += len(packet)
                         chunk_idx += 1
-                        await _pace()
+                        await _pace(packet)
 
                         # Depth chunk
                         hdr_d   = _build_depth_hdr()
@@ -445,6 +514,7 @@ class Sender():
                         if chunk_idx_depth == 0 and not is_key:
                             first_depth_packet = packet_d
                         self.data_channel_depth.send(packet_d)
+                        self.gcc_seq += 1
                         logging.debug(f"depth frame {out_fid} chunk {chunk_idx_depth} sent")
                         self.reliable_bytes_meta_depth += len(hdr_d)
                         if is_key:
@@ -457,7 +527,7 @@ class Sender():
                             self.p_bytes_depth_sent += len(packet_d)
                         self.total_bytes_depth_sent += len(packet_d)
                         chunk_idx_depth += 1
-                        await _pace()
+                        await _pace(packet_d)
 
                     # Phase 2: drain any remaining RGB chunks (if RGB had more than depth)
                     while chunk_idx < num_chunks:
@@ -467,6 +537,7 @@ class Sender():
                             cursor += len(shard)
                         packet = hdr + shard
                         self.data_channel_rgb.send(packet)
+                        self.gcc_seq += 1
                         self.reliable_bytes_meta += len(hdr)
                         if is_key:
                             self.i_bytes_sent += len(packet)
@@ -478,7 +549,7 @@ class Sender():
                             self.p_bytes_sent += len(packet)
                         self.total_bytes_sent += len(packet)
                         chunk_idx += 1
-                        await _pace()
+                        await _pace(packet)
 
                     # Phase 3: drain any remaining depth chunks
                     while chunk_idx_depth < num_chunks_depth:
@@ -488,6 +559,7 @@ class Sender():
                             cursor_depth += len(shard_d)
                         packet_d = hdr_d + shard_d
                         self.data_channel_depth.send(packet_d)
+                        self.gcc_seq += 1
                         self.reliable_bytes_meta_depth += len(hdr_d)
                         if is_key:
                             self.i_bytes_depth_sent += len(packet_d)
@@ -499,7 +571,7 @@ class Sender():
                             self.p_bytes_depth_sent += len(packet_d)
                         self.total_bytes_depth_sent += len(packet_d)
                         chunk_idx_depth += 1
-                        await _pace()
+                        await _pace(packet_d)
 
                     # Phase 4 (P-frames only): retransmit chunk 0 of both streams.
                     # The first chunk carries the slice header that the codec needs
@@ -529,8 +601,9 @@ class Sender():
                     is_key  = out["is_key"]
                     qp      = out["qp"]
                     hdr = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
-                                      int(out_fid), int(gop_id), int(qp), 0, 1, 1, int(len(payload)))
+                                      int(out_fid), int(gop_id), int(qp), 0, 1, 1, int(len(payload)), int(self.gcc_seq), float(time.perf_counter()))
                     self.data_channel_rgb.send(hdr + payload)
+                    self.gcc_seq += 1
                     self.i_bytes_sent        += len(hdr) + len(payload)
                     self.total_bytes_sent    += len(hdr) + len(payload)
                     self.reliable_bytes_meta += len(hdr)
@@ -544,8 +617,9 @@ class Sender():
                     is_key        = out_d["is_key"]
                     qp_depth      = out_d["qp"]
                     hdr_d = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
-                                        int(out_fid), int(gop_id), int(qp_depth), 0, 1, 1, int(len(payload_depth)))
+                                        int(out_fid_d), int(gop_id), int(qp_depth), 0, 1, 1, int(len(payload_depth)), int(self.gcc_seq), float(time.perf_counter()))
                     self.data_channel_depth.send(hdr_d + payload_depth)
+                    self.gcc_seq += 1
                     self.i_bytes_depth_sent       += len(hdr_d) + len(payload_depth)
                     self.total_bytes_depth_sent   += len(hdr_d) + len(payload_depth)
                     self.reliable_bytes_meta_depth += len(hdr_d)
@@ -574,9 +648,11 @@ class Sender():
         # real-time video, so we skip retransmission at the SCTP layer entirely.
         self.data_channel_rgb   = self.pc.createDataChannel("rgb_payload",   ordered=False, maxRetransmits=0)
         self.data_channel_depth = self.pc.createDataChannel("depth_payload", ordered=False, maxRetransmits=0)
+        self.data_channel_feedback = self.pc.createDataChannel("gcc_feedback", ordered=True)
 
         self.i_open = asyncio.Event()   # set when rgb_payload channel is open
         self.p_open = asyncio.Event()   # set when depth_payload channel is open
+        self.feedback_open = asyncio.Event()
 
         @self.pc.on("iceconnectionstatechange")
         async def on_state_change():
@@ -593,6 +669,21 @@ class Sender():
         def on_depth_open():
             logging.info("depth_payload channel open")
             self.p_open.set()
+
+        @self.data_channel_feedback.on("open")
+        def on_feedback_open():
+            logging.info("gcc_feedback channel open")
+            self.feedback_open.set()
+
+        @self.data_channel_feedback.on("message")
+        def on_feedback_message(message):
+            if isinstance(message, str):
+                return
+            if len(message) != SZ_GCC_FEEDBACK:
+                return
+            ar_bps, loss_fraction = struct.unpack(FMT_GCC_FEEDBACK, message)
+            self._update_gcc_from_feedback(float(ar_bps), float(loss_fraction))
+            logging.debug("GCC feedback: Ar=%.3f Mbps loss=%.3f", ar_bps / 1e6, loss_fraction)
 
         @self.data_channel_rgb.on("close")
         def on_rgb_close():

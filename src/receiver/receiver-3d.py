@@ -45,7 +45,11 @@ import cv2
 import struct
 import threading
 from zfec import Decoder
+
+import sys
 import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.sender.gcc_controller import GCCReceiverController
 
 logging.basicConfig(level=logging.INFO)
 
@@ -74,7 +78,8 @@ MSG_CHUNK = 3   # (unused; payload is appended directly after MSG_DESC)
 #         (raw shard bytes follow immediately after the fixed header)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIId"
+FMT_GCC_FEEDBACK = "<ff"
 
 # Frame-type tags that travel in the DESC header
 FRAME_TYPE_RGB   = 3
@@ -82,6 +87,7 @@ FRAME_TYPE_DEPTH = 4
 
 SZ_INIT = struct.calcsize(FMT_INIT)
 SZ_DESC = struct.calcsize(FMT_DESC)
+SZ_GCC_FEEDBACK = struct.calcsize(FMT_GCC_FEEDBACK)
 
 # Hard cap on in-flight frame slots to prevent unbounded memory growth
 MAX_FRAME_CHUNK_LIMIT = 2000
@@ -156,6 +162,18 @@ class Receiver():
         self.clock_t0      = 0.0
         self.clock_fid0    = 0
         self.first_packet_clock = None               # wall time of first packet
+
+        # ── GCC receiver-side state ──────────────────────────────────────────
+        self.gcc_controller = GCCReceiverController(initial_rate_bps=8_000_000)
+        self.gcc_feedback_channel = None
+        self.gcc_last_feedback = time.monotonic()
+        self.gcc_frame_meta = {}        # fid -> [first_send_ts, last_arrival_ts]
+        self.gcc_last_observed_fid = None
+        self.gcc_received_seqs = set()
+        self.gcc_window_first_seq = None
+        self.gcc_highest_seq = None
+        self.gcc_packets_received = 0
+        self.gcc_bytes_received = 0
 
         # ── Decode/display pipeline ──────────────────────────────────────────
         self.stop_event    = asyncio.Event()
@@ -265,6 +283,60 @@ class Receiver():
             "shard_len_depth":  None,
             "recv_count_depth": 0,
         }
+
+    def _gcc_note_packet(self, fid, seq, send_ts, packet_len):
+        now = time.monotonic()
+        self.gcc_controller.note_received_bytes(packet_len, now)
+        self.gcc_packets_received += 1
+        self.gcc_bytes_received += int(packet_len)
+
+        if seq is not None:
+            seq = int(seq)
+            if self.gcc_window_first_seq is None:
+                self.gcc_window_first_seq = seq
+            self.gcc_highest_seq = seq if self.gcc_highest_seq is None else max(self.gcc_highest_seq, seq)
+            self.gcc_received_seqs.add(seq)
+
+        meta = self.gcc_frame_meta.setdefault(int(fid), [None, None])
+        if meta[0] is None:
+            meta[0] = float(send_ts)
+        meta[1] = now
+
+        # When a newer frame appears, finalize the previous frame's GCC timing
+        # sample. This implements first-packet-send to last-packet-arrival.
+        if self.gcc_last_observed_fid is None:
+            self.gcc_last_observed_fid = int(fid)
+        elif int(fid) > self.gcc_last_observed_fid:
+            prev = self.gcc_frame_meta.get(self.gcc_last_observed_fid)
+            if prev and prev[0] is not None and prev[1] is not None:
+                self.gcc_controller.note_frame(self.gcc_last_observed_fid, prev[0], prev[1])
+            self.gcc_last_observed_fid = int(fid)
+
+    def _gcc_send_feedback_if_due(self, channel):
+        now = time.monotonic()
+        # Send feedback every 50 ms
+        if now - self.gcc_last_feedback < 0.05:
+            return
+        if self.gcc_window_first_seq is None or self.gcc_highest_seq is None:
+            return
+
+        expected = max(1, self.gcc_highest_seq - self.gcc_window_first_seq + 1)
+        received = sum(1 for seq in self.gcc_received_seqs if seq >= self.gcc_window_first_seq)
+        loss = max(0.0, min(1.0, 1.0 - received / expected))
+        ar, rr, m_ms, gamma_ms, state = self.gcc_controller.feedback()
+        try:
+            channel.send(struct.pack(FMT_GCC_FEEDBACK, float(ar), float(loss)))
+            logging.info(
+                "[GCC] feedback Ar=%.3f Mbps loss=%.3f delay_grad=%.2f ms recv=%.3f Mbps state=%s gamma=%.2f ms",
+                ar / 1e6, loss, m_ms, rr / 1e6, state, gamma_ms
+            )
+        except Exception as e:
+            logging.warning("[GCC] failed to send feedback: %s", e)
+            return
+
+        self.gcc_last_feedback = now
+        self.gcc_window_first_seq = self.gcc_highest_seq + 1
+        self.gcc_received_seqs.clear()
 
     def _deadline_time(self, fid: int, caller=None) -> float:
         """
@@ -680,12 +752,18 @@ class Receiver():
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             logging.info("Receiver: DataChannel %s created", channel.label)
+            if channel.label == "gcc_feedback":
+                self.gcc_feedback_channel = channel
 
             @channel.on("message")
             async def on_message(msg):
                 try:
                     if isinstance(msg, str):
                         msg = msg.encode("utf-8")
+
+                    # Feedback channel is receiver -> sender; media channels carry DESC+payload.
+                    if channel.label == "gcc_feedback":
+                        return
 
                     # ── INIT message: learn stream parameters ────────────────
                     if len(msg) == SZ_INIT and msg[0] == MSG_INIT:
@@ -708,7 +786,7 @@ class Receiver():
                         return  # too short to be a valid DESC packet; discard
 
                     (mtype, frame_type, fid, gop_id, qp,
-                     chunk_idx, num_chunks, k_data, total_size) = struct.unpack(FMT_DESC, msg[:SZ_DESC])
+                     chunk_idx, num_chunks, k_data, total_size, seq, send_ts) = struct.unpack(FMT_DESC, msg[:SZ_DESC])
 
                     if mtype != MSG_DESC:
                         return  # unexpected message type
@@ -722,6 +800,14 @@ class Receiver():
                     k_data     = int(k_data)
                     total_size = int(total_size)
                     frame_type = int(frame_type)
+                    seq        = int(seq)
+                    send_ts    = float(send_ts)
+
+                    # GCC measurements are based on packet arrival, not decode
+                    # completion. This prevents slow decoding from masquerading
+                    # as network congestion.
+                    self._gcc_note_packet(fid, seq, send_ts, len(msg))
+                    self._gcc_send_feedback_if_due(self.gcc_feedback_channel) if self.gcc_feedback_channel is not None else None
 
                     with self.fc_cv:
                         # Discard stale P-frames that belong to an already-decoded (older) GOP
@@ -825,8 +911,9 @@ class Receiver():
                             logging.info("[Receiver] Received bye — draining remaining frames (100 ms)")
                             await asyncio.sleep(0.1)
                             self.stop_threads.set()
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
                             gc.collect()
                             logging.info("Closing WebSocket and stopping")
                             break
