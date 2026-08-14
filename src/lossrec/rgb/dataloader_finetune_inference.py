@@ -71,9 +71,23 @@ class LossRecoveryData(Dataset):
                     self.mask_cache[mask_path] = np.load(mask_path, allow_pickle=True)
                 raw_mask = self.mask_cache[mask_path]
 
-                # Trim all three sources to the shortest length to avoid out-of-bounds access
-                valid_len  = min(len_clean, len_corr, len(raw_mask))
-                frame_mask = raw_mask[:valid_len]
+                # Align the three sources before trimming.
+                #
+                # The receiver starts writing its output at the first keyframe it
+                # can decode, which is not necessarily fid 0 (commonly fid 30).
+                # The clean video and the mask are both indexed from fid 0, so
+                # indexing all three by the same i compares a ground-truth frame
+                # against a received frame a full GOP later, AND reads the mask
+                # entry for the wrong frame -- so the model reconstructs frames
+                # that were fine and skips the ones that were damaged.
+                #
+                # LOSSREC_FID0 is the fid the corrupted video starts at; take it
+                # from the receiver log rather than assuming zero.
+                fid0 = int(os.environ.get("LOSSREC_FID0", "0"))
+                clean_off = raw_mask[fid0:] if fid0 else raw_mask
+                valid_len  = min(len_clean - fid0, len_corr, len(clean_off))
+                frame_mask = clean_off[:valid_len]
+                self.clean_offset = fid0
 
                 total_corrupted += int(np.count_nonzero(frame_mask))
 
@@ -121,17 +135,25 @@ class LossRecoveryData(Dataset):
         clean_dec = VideoDecoder(clean_path, device="cpu")
         corr_dec  = VideoDecoder(corrupted_path, device="cpu")
 
-        # Clamp indices if a decoder reports fewer frames than expected at construction time
-        safe_len      = min(len(clean_dec), len(corr_dec)) - 1
-        frame_indices = [min(i, safe_len) for i in frame_indices]
+        # frame_indices are positions in the CORRUPTED video. The clean video is
+        # indexed from fid 0, so reading it at the same position compares frames a
+        # GOP apart. Shift the clean read by the receiver's starting fid.
+        off = getattr(self, "clean_offset", 0)
+        safe_corr  = len(corr_dec) - 1
+        safe_clean = len(clean_dec) - 1
+        frame_indices  = [min(i, safe_corr) for i in frame_indices]
+        clean_indices  = [min(i + off, safe_clean) for i in frame_indices]
 
-        clean_frames     = torch.stack([clean_dec[i] for i in frame_indices])   # [T, C, H, W]
+        clean_frames     = torch.stack([clean_dec[i] for i in clean_indices])   # [T, C, H, W]
         corrupted_frames = torch.stack([corr_dec[i]  for i in frame_indices])   # [T, C, H, W]
 
         clean_clip     = self.transform(clean_frames).permute(1, 0, 2, 3)       # [C, T, H, W]
         corrupted_clip = self.transform(corrupted_frames).permute(1, 0, 2, 3)   # [C, T, H, W]
 
-        clip_mask = torch.from_numpy(self.mask_cache[mask_path][frame_indices]).long()
+        # self.mask_cache holds the RAW mask (fid-indexed); shift to match.
+        clip_mask = torch.from_numpy(
+            self.mask_cache[mask_path][[min(i + off, len(self.mask_cache[mask_path]) - 1)
+                                        for i in frame_indices]]).long()
         if len(clip_mask) < self.num_frames:
             pad = self.num_frames - len(clip_mask)
             clip_mask = torch.cat([clip_mask, torch.zeros(pad, dtype=torch.long)])
