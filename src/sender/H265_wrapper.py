@@ -121,8 +121,13 @@ class H265VideoCodec:
         # The earliest "inflight" frame now gets its payload
         out_id = self._inflight_ids.popleft()
 
-        is_key = (out_id == 0 or
-                  (self.intra_period > 0 and out_id % self.intra_period == 0))
+        # Ask the encoder, do not infer from position. Any QP change rebuilds
+        # the encoder, and a fresh x265 instance may not emit a packet on its
+        # first frame -- out_id then slips relative to frame_id and positional
+        # inference labels the wrong frames as keyframes. FEC is applied to the
+        # wrong frames and the receiver's GOP tracking desyncs, which collapsed
+        # the stream to 0.19 MB delivered of 23.6 MB sent.
+        is_key = any(p.is_keyframe for p in packets)
         qp = self.qp_i if is_key else self.qp_p
 
         yield {
@@ -159,8 +164,8 @@ class H265VideoCodec:
                 out_id = self._inflight_ids.popleft()
 
             H, W = self.height, self.width
-            is_key = (out_id == 0 or
-                      (self.intra_period > 0 and out_id % self.intra_period == 0))
+            # Encoder truth, not position -- see note above.
+            is_key = any(p.is_keyframe for p in packets)
             qp = self.qp_i if is_key else self.qp_p
 
             yield {

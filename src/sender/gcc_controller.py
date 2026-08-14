@@ -15,16 +15,41 @@ class GCCController:
         self.target_rate_bps = float(initial_rate_bps)
         self.min_rate_bps = float(min_rate_bps)
         self.max_rate_bps = float(max_rate_bps)
+        self._last_as_update = None
+        # Loss is averaged over this window before driving As. Individual 50 ms
+        # reports are far too noisy on a bursty link: most windows read exactly
+        # 0.0 even when the mean loss is 7.6%.
+        self._loss_hist = deque()
+        self._loss_window_s = 1.0
 
-    def update(self, ar_bps=None, loss_fraction=0.0):
+    def update(self, ar_bps=None, loss_fraction=0.0, now=None):
+        now = time.monotonic() if now is None else float(now)
         if ar_bps is not None and ar_bps > 0:
             self.ar_bps = self._clamp(float(ar_bps))
 
         f = max(0.0, min(1.0, float(loss_fraction)))
-        if f > 0.10:
-            self.as_bps *= (1.0 - 0.5 * f)
-        elif f < 0.02:
-            self.as_bps *= 1.05
+        self._loss_hist.append((now, f))
+        while self._loss_hist and now - self._loss_hist[0][0] > self._loss_window_s:
+            self._loss_hist.popleft()
+        f_avg = (sum(x for _, x in self._loss_hist) / len(self._loss_hist)
+                 if self._loss_hist else f)
+
+        # Time-scale the adaptation. The paper's +5% / -0.5f steps are per
+        # UPDATE INTERVAL (~1 s), but feedback arrives every 50 ms here, so
+        # applying them per message compounds to 1.05^20 ~ 2.65x per second and
+        # As pegs at the ceiling within seconds -- measured at 36-45 Mbps on a
+        # 2.5 Mbps link, which makes the loss-based half of GCC inert.
+        if self._last_as_update is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, min(1.0, now - self._last_as_update))
+        self._last_as_update = now
+
+        if dt > 0.0:
+            if f_avg > 0.10:
+                self.as_bps *= (1.0 - 0.5 * f_avg) ** dt
+            elif f_avg < 0.02:
+                self.as_bps *= 1.05 ** dt
 
         self.as_bps = self._clamp(self.as_bps)
         self.target_rate_bps = self._clamp(min(self.ar_bps, self.as_bps))
@@ -159,8 +184,15 @@ class GCCReceiverController:
             elif self.state == 'NORMAL':
                 # Probing/Additive increase when channel is stable
                 # Increase by 5% or minimum step of 100 kbps
+                # The cap must be relative to the MEASURED receive rate. Capping
+                # at 1.5 * max(rr, ar_bps) becomes 1.5 * ar_bps as soon as ar_bps
+                # exceeds rr, which is always above ar_bps + 5% -- so the cap
+                # never binds and Ar compounds without limit. Observed on a
+                # 2.5 Mbps link: Ar climbed 8.0 -> 9.7 Mbps while only 0.2 Mbps
+                # was actually arriving. Capacity cannot be inferred above what
+                # has actually been pushed through the path.
                 increase = max(self.ar_bps * 0.05, 100_000.0)
-                self.ar_bps = min(self.ar_bps + increase, 1.5 * max(rr, self.ar_bps))
+                self.ar_bps = min(self.ar_bps + increase, 1.5 * rr)
 
         self.ar_bps = max(self.min_rate_bps, min(self.max_rate_bps, self.ar_bps))
         self.last_rate_update = now

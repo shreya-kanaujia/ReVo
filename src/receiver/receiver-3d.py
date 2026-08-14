@@ -90,6 +90,12 @@ SZ_DESC = struct.calcsize(FMT_DESC)
 SZ_GCC_FEEDBACK = struct.calcsize(FMT_GCC_FEEDBACK)
 
 # Hard cap on in-flight frame slots to prevent unbounded memory growth
+# Explicit playout buffer. Without it the buffer is clock_fid0 * T -- i.e.
+# whatever the network happened to lose at startup -- which varied run to run and
+# was the single largest source of variance we measured. A delayed retransmission
+# is also only usable if the buffer covers it.
+REVO_PLAYOUT_MS = float(os.environ.get("REVO_PLAYOUT_MS", "1000"))
+
 MAX_FRAME_CHUNK_LIMIT = 2000
 
 
@@ -343,7 +349,8 @@ class Receiver():
         Wall-clock deadline for frame fid: the moment it should be displayed.
         deadline(fid) = clock_t0 + (fid + 1) * T
         """
-        return self.clock_t0 + (fid + 1) * self.T
+        return (self.clock_t0 + (fid - self.clock_fid0 + 1) * self.T
+                + REVO_PLAYOUT_MS / 1000.0)
 
     # ────────────────────────────────────────────────────────────────────────
     # Best-effort payload builder (P-frames with missing chunks)
@@ -426,6 +433,28 @@ class Receiver():
         """
         print(f"{RED}Decode worker thread start{RESET}")
         while not self.stop_threads.is_set():
+            # Upstream blocks forever on frame 0 (deadline = 9999999999). If that
+            # keyframe is lost -- routine on a trace whose first 45 ms carry
+            # 35-70% loss -- the run reads nothing while the whole stream goes
+            # past: measured 23.6 MB sent, 0 frames decoded. Do not advance
+            # through frame ids before the clock starts either; that retires fids
+            # whose data has not arrived yet. Wait, then jump to a keyframe that
+            # has actually been received.
+            if not self.clock_started:
+                with self.fc_lock:
+                    cands = [f for f, c in self.frame_content.items()
+                             if c and c.get("is_key")
+                             and c.get("k_data") is not None
+                             and c.get("recv_count", 0) >= int(c["k_data"])]
+                    if cands:
+                        nxt = min(cands)
+                        if nxt != int(self.expected_frame):
+                            logging.info(f"[RESYNC] starting at first decodable "
+                                         f"keyframe fid={nxt}")
+                            self.expected_frame = nxt
+                    else:
+                        self.fc_cv.wait(timeout=0.05)
+                        continue
             fid    = int(self.expected_frame)
             with self.fc_cv:
                 fc = self.frame_content.get(fid)
@@ -434,7 +463,8 @@ class Receiver():
             # Deadline for this frame = display time of the previous frame
             deadline = self._deadline_time(fid - 1, "decode")
             if not self.clock_started:
-                deadline = 9999999999  # block indefinitely until first I-frame arrives
+                # Bounded backstop; the resync above is the primary mechanism.
+                deadline = time.perf_counter() + 2.0
 
             # ── Wait for full assembly or deadline ───────────────────────────
             while True:
@@ -466,6 +496,7 @@ class Receiver():
                         if (not self.clock_started) and is_key:
                             print(f"{RED}Starting deadline clock.{RESET}")
                             self.clock_started  = True
+                            self.clock_fid0     = fid   # origin for all deadlines
                             # Give ~1 frame of buffer before the first deadline fires
                             self.clock_t0       = max(self.first_packet_clock + self.T,
                                                       time.perf_counter() + 0.066)
@@ -687,7 +718,8 @@ class Receiver():
 
         while not self.stop_threads.is_set():
             now        = time.perf_counter()
-            target_fid = int((now - clock_t0) / T)   # frame we "should" be at right now
+            target_fid = (int((now - clock_t0 - REVO_PLAYOUT_MS / 1000.0) / T)
+                          + self.clock_fid0)   # frame we "should" be at right now
 
             # Sleep until the next frame is due
             next_time = self._deadline_time(self.display_next_fid, "display")
@@ -792,8 +824,13 @@ class Receiver():
                         return  # unexpected message type
 
                     fid        = int(fid)
-                    is_key     = self._is_iframe(fid)
                     gop_id     = int(gop_id)
+                    # The sender sets gop_id to the fid of the keyframe that
+                    # starts the GOP, so gop_id == fid identifies a keyframe at
+                    # ANY position. Positional inference (fid % intra_period)
+                    # breaks as soon as a QP change rebuilds the encoder and
+                    # shifts the IDR schedule.
+                    is_key     = (gop_id == fid)
                     qp         = int(qp)
                     chunk_idx  = int(chunk_idx)
                     num_chunks = int(num_chunks)

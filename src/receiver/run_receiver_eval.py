@@ -34,7 +34,7 @@ import time
 HOST_IP      = "0.0.0.0"   # listen on all interfaces
 CONTROL_PORT = 6000         # must match run_sender_eval.py
 CODEC        = "h265"       # "h265", "h264", or "dcvcrt" (must match sender)
-SERVER_IP    = "10.0.0.5"   # signaling server IP
+SERVER_IP    = "10.0.0.5"   # signaling server IPEXTRA20OFF
 
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 RECEIVER_SCRIPT = os.path.join(BASE_DIR, "receiver-3d.py")
@@ -55,6 +55,7 @@ def get_category(run_id: str) -> str:
     <video_stem>_<category>_<trace_stem>.
     Returns "mixed" if no known category tag is found.
     """
+
     run_id_lower = run_id.lower()
     for cat in CATEGORIES:
         if f"_{cat}_" in run_id_lower:
