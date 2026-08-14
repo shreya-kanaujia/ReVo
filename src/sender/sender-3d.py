@@ -70,19 +70,38 @@ BUFFERED_WATERMARK_HARD = 128 * 1024  # 128 KB
 #                        sender degrades (sender-side congestion)
 #   SALSIFY_MISS_THRESH  receiver-reported deadline-miss rate, in percent,
 #                        above which the sender degrades (loss or lateness)
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULTS ARE THE TUNED CONFIGURATION. Running run_sender_eval.py /
+# run_receiver_eval.py with no environment variables reproduces the best
+# measured setup; every value below is only an override.
+#
+#   ladder            QP 25 / 30 / 35   (MID = 30 = stock, so a calm link sends
+#                                        exactly what the baseline sends)
+#   GOP               30                (per-tier GOP 15 measured worse)
+#   thresholds        degrade >8% miss, recover <4%   (trace14 p90 / p75)
+#   keyframe FEC      adaptive 0.5-1.5, packet-capped (~29% fewer keyframe losses)
+#   duplicate spacing 100 ms                          (+0.069 SSIM, t=6.2)
+#   playout buffer    1000 ms  (receiver: REVO_PLAYOUT_MS)
+#
+# CAVEAT on the last two: the delayed duplicate is only usable while the playout
+# buffer exceeds the spacing. 1000 ms of buffer is NOT conferencing-realistic --
+# it reproduces the buffer stock ReVo was inheriting by accident. For a latency
+# budget, set e.g. SALSIFY_DUP_DELAY_MS=33 with REVO_PLAYOUT_MS=66, or disable
+# spacing with SALSIFY_DUP_DELAY_MS=0 (stock behaviour).
+# ─────────────────────────────────────────────────────────────────────────────
 SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "1"))
-SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "30"))
+SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "25"))
 SALSIFY_RGB_QP_MID  = int(os.environ.get("SALSIFY_RGB_QP_MID", "30"))
-SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "30"))
-SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "30"))
+SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "35"))
+SALSIFY_DEPTH_QP_HI = int(os.environ.get("SALSIFY_DEPTH_QP_HI", "25"))
 SALSIFY_DEPTH_QP_MID = int(os.environ.get("SALSIFY_DEPTH_QP_MID", "30"))
-SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "30"))
+SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "35"))
 SALSIFY_SOFT_FRAC   = float(os.environ.get("SALSIFY_SOFT_FRAC", "0.5"))
-SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "5.0"))
+SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "8.0"))
 # Upgrade threshold, deliberately below MISS_THRESH. The gap between the two is
 # a dead band in which the level holds, which is what stops the controller
 # oscillating without making it react slowly.
-SALSIFY_MISS_CLEAR  = float(os.environ.get("SALSIFY_MISS_CLEAR", "2.0"))
+SALSIFY_MISS_CLEAR  = float(os.environ.get("SALSIFY_MISS_CLEAR", "4.0"))
 # Keyframe interval. Default 30 matches stock. The receiver must be told the
 # same value (REVO_GOP) or its I-frame position fallback disagrees with the
 # sender's schedule.
@@ -90,7 +109,7 @@ SALSIFY_GOP         = int(os.environ.get("SALSIFY_GOP", "30"))
 # Frames that must pass between two forced recovery keyframes. Guards against a
 # request storm without making recovery slow: the receiver already rate-limits
 # its own retries, so this only needs to stop pathological feedback loops.
-SALSIFY_KF_COOLDOWN = int(os.environ.get("SALSIFY_KF_COOLDOWN", "30"))
+SALSIFY_KF_COOLDOWN = int(os.environ.get("SALSIFY_KF_COOLDOWN", "10"))
 # Minimum GOPs a committed level must be held before another change. With the
 # clock fix the feedback loop is 6 frames instead of 36, and the old 1-second lag
 # had been acting as accidental damping: switches jumped 45-57 -> 156 and frozen
@@ -115,7 +134,7 @@ SALSIFY_KF_SKIP_NEAR = int(os.environ.get("SALSIFY_KF_SKIP_NEAR", "10"))
 # The cap is not optional: parity packets all leave inside one frame slot, so n
 # packets is an instantaneous n*chunk*8*fps bitrate. Uncapped, this previously
 # overran the link and caused the very loss it was added to survive.
-SALSIFY_FEC_ADAPT = int(os.environ.get("SALSIFY_FEC_ADAPT", "0"))
+SALSIFY_FEC_ADAPT = int(os.environ.get("SALSIFY_FEC_ADAPT", "1"))
 SALSIFY_FEC_MIN   = float(os.environ.get("SALSIFY_FEC_MIN", "0.5"))
 SALSIFY_FEC_MAX   = float(os.environ.get("SALSIFY_FEC_MAX", "1.5"))
 SALSIFY_FEC_MAXPK = int(os.environ.get("SALSIFY_FEC_MAXPK", "24"))
@@ -148,7 +167,7 @@ SALSIFY_FEC_COMPENSATE = float(os.environ.get("SALSIFY_FEC_COMPENSATE", "0"))
 # but not the p75 one -- both copies die together and the redundancy is wasted.
 # Pushing separation past ~40 ms clears roughly 85% of bursts instead of ~50%,
 # at zero extra bandwidth (the copy is already being sent).
-SALSIFY_DUP_DELAY_MS = float(os.environ.get("SALSIFY_DUP_DELAY_MS", "0"))
+SALSIFY_DUP_DELAY_MS = float(os.environ.get("SALSIFY_DUP_DELAY_MS", "100"))
 
 SALSIFY_GOP_TIERS = os.environ.get("SALSIFY_GOP_TIERS", "").strip()
 _GOP_BY_TIER = ([int(x) for x in SALSIFY_GOP_TIERS.split(",")]
