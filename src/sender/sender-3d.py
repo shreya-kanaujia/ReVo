@@ -79,6 +79,80 @@ SALSIFY_DEPTH_QP_MID = int(os.environ.get("SALSIFY_DEPTH_QP_MID", "30"))
 SALSIFY_DEPTH_QP_LO = int(os.environ.get("SALSIFY_DEPTH_QP_LO", "30"))
 SALSIFY_SOFT_FRAC   = float(os.environ.get("SALSIFY_SOFT_FRAC", "0.5"))
 SALSIFY_MISS_THRESH = float(os.environ.get("SALSIFY_MISS_THRESH", "5.0"))
+# Upgrade threshold, deliberately below MISS_THRESH. The gap between the two is
+# a dead band in which the level holds, which is what stops the controller
+# oscillating without making it react slowly.
+SALSIFY_MISS_CLEAR  = float(os.environ.get("SALSIFY_MISS_CLEAR", "2.0"))
+# Keyframe interval. Default 30 matches stock. The receiver must be told the
+# same value (REVO_GOP) or its I-frame position fallback disagrees with the
+# sender's schedule.
+SALSIFY_GOP         = int(os.environ.get("SALSIFY_GOP", "30"))
+# Frames that must pass between two forced recovery keyframes. Guards against a
+# request storm without making recovery slow: the receiver already rate-limits
+# its own retries, so this only needs to stop pathological feedback loops.
+SALSIFY_KF_COOLDOWN = int(os.environ.get("SALSIFY_KF_COOLDOWN", "30"))
+# Minimum GOPs a committed level must be held before another change. With the
+# clock fix the feedback loop is 6 frames instead of 36, and the old 1-second lag
+# had been acting as accidental damping: switches jumped 45-57 -> 156 and frozen
+# went 5.8% -> 13.5% purely from the controller reacting to noise it could not
+# previously see. Damping has to be explicit once the delay is gone.
+SALSIFY_MIN_DWELL   = int(os.environ.get("SALSIFY_MIN_DWELL", "2"))
+# Skip a recovery keyframe when a scheduled one is already this close: the
+# recovery cannot arrive meaningfully sooner, so it is pure added load at the
+# worst moment. Measured: with fast feedback only 51% of forced keyframes
+# survived (vs 82% when they were rare), i.e. failed recoveries were feeding
+# the congestion that killed them.
+SALSIFY_KF_SKIP_NEAR = int(os.environ.get("SALSIFY_KF_SKIP_NEAR", "10"))
+# ── Loss-adaptive keyframe protection ────────────────────────────────────────
+# The useful adaptation on this link is not fidelity but PROTECTION. Every trace
+# holds a 2.50 Mbps floor while the top tier needs ~0.4 Mbps, so bandwidth never
+# binds and choosing a QP cannot buy anything -- proven by the raised-ladder
+# runs, where spending the headroom on fidelity made quality significantly WORSE
+# (-0.04 SSIM, t=-3.3..-3.8). Meanwhile keyframe cascades cause 63-89% of all
+# frozen frames. So scale keyframe parity with measured loss and spend the idle
+# bandwidth there instead.
+#
+# The cap is not optional: parity packets all leave inside one frame slot, so n
+# packets is an instantaneous n*chunk*8*fps bitrate. Uncapped, this previously
+# overran the link and caused the very loss it was added to survive.
+SALSIFY_FEC_ADAPT = int(os.environ.get("SALSIFY_FEC_ADAPT", "0"))
+SALSIFY_FEC_MIN   = float(os.environ.get("SALSIFY_FEC_MIN", "0.5"))
+SALSIFY_FEC_MAX   = float(os.environ.get("SALSIFY_FEC_MAX", "1.5"))
+SALSIFY_FEC_MAXPK = int(os.environ.get("SALSIFY_FEC_MAXPK", "24"))
+# Compensate the degrade threshold for parity we chose to add.
+#
+# Adaptive FEC raises I-frame load ~14%, which costs unprotected P-frames
+# (measured: lost_P 192 -> 255) and therefore inflates the receiver's miss rate.
+# The controller cannot tell "the link got worse" from "we chose to send more
+# redundancy", so it degrades in response to our own parity: HI residency fell
+# 81.6% -> 75.4% and MID rose 9.9% -> 16.9%. That self-inflicted fidelity loss
+# is what cancelled the SSIM gain the freeze reduction should have produced.
+#
+# Scale the degrade threshold with the parity currently in use, so only miss
+# ABOVE what our own redundancy explains counts as network degradation.
+SALSIFY_FEC_COMPENSATE = float(os.environ.get("SALSIFY_FEC_COMPENSATE", "0"))
+# Per-tier GOP. "" keeps the single static SALSIFY_GOP; "15,30,15" gives
+# HI=15, MID=30, LO=15.
+#
+# Rationale (measured): a P-frame loss poisons every frame from the loss to the
+# END of its GOP, and that is the dominant damage -- 1892 P-corrupt frames vs
+# 301 I-corrupt, with a mean poisoned span of 17.7 frames. Capping the GOP caps
+# that span. It costs twice as many keyframes, whose extra bytes buy back some
+# P-loss, so the net is an empirical question.
+# Delay the P-frame duplicate by this many milliseconds instead of sending it at
+# the end of the same frame window.
+#
+# Measured on trace14: loss arrives in bursts, p50 15 ms / p75 30 ms / p90 60 ms,
+# and 80% of bursts are shorter than one 33 ms frame slot. The duplicate is
+# currently emitted ~16-33 ms after the original, so it clears the median burst
+# but not the p75 one -- both copies die together and the redundancy is wasted.
+# Pushing separation past ~40 ms clears roughly 85% of bursts instead of ~50%,
+# at zero extra bandwidth (the copy is already being sent).
+SALSIFY_DUP_DELAY_MS = float(os.environ.get("SALSIFY_DUP_DELAY_MS", "0"))
+
+SALSIFY_GOP_TIERS = os.environ.get("SALSIFY_GOP_TIERS", "").strip()
+_GOP_BY_TIER = ([int(x) for x in SALSIFY_GOP_TIERS.split(",")]
+                if SALSIFY_GOP_TIERS else None)
 
 FPS_FALLBACK = 30  # used when the video file has no metadata fps
 
@@ -144,21 +218,46 @@ class Sender():
         # ── Adaptive-quality state ───────────────────────────────────────────
         self.recv_miss_rate = 0.0  # deadline-miss rate last reported by the receiver (%)
         self.feedback_seen = False
-        self.quality_levels = {"rgb": 1, "depth": 1} #default to mid-level quality (0=hi, 1=mid, 2=lo)
-        self.quality_streaks = {"rgb": 0, "depth": 0}
+        # Starting tier (0=hi, 1=mid, 2=lo). Starting at MID is right when MID is
+        # deliverable, but on a link whose capacity sits below MID the controller
+        # begins above capacity and has to fight its way down, losing frames the
+        # whole way. Measured on trace14 with the 8/12/16 ladder: it ended up at
+        # LO for 84% of the run, but the descent cost 15.4-16.8% frozen against
+        # fixed QP16's 12.4%. Starting low and climbing only on demonstrated
+        # headroom pays that cost once, in the safe direction.
+        _start = int(os.environ.get("SALSIFY_START", "1"))
+        self.quality_levels = {"rgb": _start, "depth": _start}
+        # Level the controller currently wants. Recomputed every frame; copied
+        # into quality_levels only at an IDR, where the rebuild is free.
+        self.desired_levels = {"rgb": _start, "depth": _start}
+        self.current_frame_id = 0   # loop index; the clock for all cooldowns
+        self.qp_switches      = 0   # committed level changes, for the summary
+        self.last_commit_fid  = -10**9   # fid of the last committed level change
+        self.kf_skipped       = 0   # recoveries suppressed as pointless
+        self._cur_fec_r       = SALSIFY_FEC_MIN   # parity ratio currently in use
+        # Predicted fid of the next scheduled keyframe. Tracked from the
+        # encoder's ACTUAL output rather than arithmetic on frame_id, so it stays
+        # correct across both forced keyframes and GOP changes.
+        # Duplicates held back for delayed transmission: (due_time, chan, packet).
+        self._dup_queue       = []
+        self.dup_sent         = 0   # delayed duplicates actually transmitted
+        self._next_key_fid    = 0
+        self._cur_gop         = SALSIFY_GOP
+        self.kf_sent_count    = 0   # keyframes actually emitted by the encoder
+        self.kf_forced_count  = 0   # of those, ones triggered by a request
         self.force_keyframe_pending = False
         self.last_forced_keyframe_fid = -999
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
-        self.codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_RGB_QP_MID)
+        self.codec = h265.H265VideoCodec(intra_period=SALSIFY_GOP, qp=SALSIFY_RGB_QP_MID)
         if args.codec == "dcvcrt":
             self.codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
             self.codec = h264.H264VideoCodec(intra_period=30)
 
         # Depth codec (mirrors RGB codec choice)
-        self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=SALSIFY_DEPTH_QP_MID)
+        self.depth_codec = h265.H265VideoCodec(intra_period=SALSIFY_GOP, qp=SALSIFY_DEPTH_QP_MID)
         if args.codec == "dcvcrt":
             self.depth_codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
@@ -300,51 +399,135 @@ class Sender():
         return SALSIFY_DEPTH_QP_MID
 
     def _activate_codec_qp(self, stream: str, level: int) -> None:
+        """Swap the encoder for one at a different QP. No-op if QP is unchanged.
+
+        Replacing the encoder throws away anything still inside x265's pipeline,
+        which would silently drop those frames. bframes=0 and rc-lookahead=0
+        should mean nothing is ever buffered, but that is an assumption about the
+        encoder's behaviour, so it is checked and reported rather than trusted.
+        """
         if not SALSIFY_MODE or self.args.codec != "h265":
             return
-        qp = self._qp_for_level(stream, level)
+        qp  = self._qp_for_level(stream, level)
+        gop = self._gop_for_level(level)
+        old = self.codec if stream == "rgb" else self.depth_codec
+        # Rebuild when EITHER qp or GOP changes -- with a per-tier GOP, two tiers
+        # can share a qp while needing different keyframe intervals.
+        if (getattr(old, "qp_p", None) == qp
+                and int(getattr(old, "intra_period", -1)) == gop):
+            return
+        inflight = len(getattr(old, "_inflight_ids", ()) or ())
+        if inflight:
+            logging.warning(
+                f"[Adaptive] rebuilding {stream} encoder at fid "
+                f"{self.current_frame_id} with {inflight} frame(s) still in the "
+                f"x265 pipeline -- those frames will be dropped"
+            )
+        new = h265.H265VideoCodec(intra_period=gop, qp=qp)
         if stream == "rgb":
-            current_qp = getattr(self.codec, "qp_p", None)
-            if current_qp == qp:
-                return
-            self.codec = h265.H265VideoCodec(intra_period=30, qp=qp)
+            self.codec = new
         else:
-            current_qp = getattr(self.depth_codec, "qp_p", None)
-            if current_qp == qp:
-                return
-            self.depth_codec = h265.H265VideoCodec(intra_period=30, qp=qp)
+            self.depth_codec = new
 
-    def _maybe_update_quality(self, *, frame_id: int, ba: int, is_key: bool) -> None:
+    def _gop_for_level(self, level: int) -> int:
+        """GOP length for a tier. Falls back to the static value when no
+        per-tier mapping is configured."""
+        if not _GOP_BY_TIER:
+            return SALSIFY_GOP
+        return _GOP_BY_TIER[max(0, min(level, len(_GOP_BY_TIER) - 1))]
+
+    def _fec_n(self, k: int) -> int:
+        """Total shards for a keyframe of k data shards.
+
+        Stock is ceil(1.5*k). With SALSIFY_FEC_ADAPT the parity ratio rises with
+        the receiver-reported miss rate, bounded by a hard packet cap so a
+        keyframe can never become a burst large enough to congest the link.
+        """
+        if not SALSIFY_FEC_ADAPT:
+            return k + (k + 1) // 2
+        m = self.recv_miss_rate
+        if   m <= 1.0:  r = SALSIFY_FEC_MIN
+        elif m >= 10.0: r = SALSIFY_FEC_MAX
+        else:
+            f = (m - 1.0) / 9.0
+            r = SALSIFY_FEC_MIN + f * (SALSIFY_FEC_MAX - SALSIFY_FEC_MIN)
+        self._cur_fec_r = r          # what the compensation reads
+        n = max(k + 1, int(-(-k * (1.0 + r) // 1)))
+        # The cap limits the burst, but must never protect a keyframe LESS than
+        # stock would: for a large k, min(n, MAXPK) would otherwise fall back to
+        # near-zero parity and make big keyframes more fragile than baseline.
+        stock = k + (k + 1) // 2
+        return min(n, max(stock, SALSIFY_FEC_MAXPK))
+
+    def _decide_quality(self, *, frame_id: int, ba: int) -> None:
+        """Recompute the wanted level from the freshest feedback. Runs EVERY frame.
+
+        Deciding only at GOP boundaries meant acting on the network as it was up
+        to a second ago, and the two-report streak counter added another second
+        on top. Both were there to stop the level oscillating -- but oscillation
+        is better fixed with hysteresis than with delay: separate degrade and
+        upgrade thresholds leave a dead band where the level simply holds, so the
+        decision can be instant without flapping.
+
+        This only chooses a level; applying it is deferred to an IDR, because a
+        QP change rebuilds the encoder and therefore forces one.
+        """
         if not SALSIFY_MODE or self.args.codec != "h265" or not self.feedback_seen:
             return
-        if frame_id < 3 or not is_key:
-            return
 
-        pressures = {
-            "rgb": (
-                ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
-                or self.recv_miss_rate > SALSIFY_MISS_THRESH
-            ),
-            "depth": (
-                ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
-                or self.recv_miss_rate > SALSIFY_MISS_THRESH
-            ),
-        }
         for stream in ("rgb", "depth"):
             current = self.quality_levels[stream]
-            target = (
-                min(current + 1, 2) if pressures[stream] else max(current - 1, 0)
-            )
-            if target != current:
-                self.quality_streaks[stream] += 1
-                if self.quality_streaks[stream] >= 2:
-                    self.quality_levels[stream] = target
-                    self.quality_streaks[stream] = 0
+            # Only miss beyond what our own added parity explains is evidence
+            # the network degraded.
+            _excess = max(0.0, getattr(self, "_cur_fec_r", SALSIFY_FEC_MIN) - SALSIFY_FEC_MIN)
+            _thr    = SALSIFY_MISS_THRESH * (1.0 + SALSIFY_FEC_COMPENSATE * _excess)
+            if (ba > BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC
+                    or self.recv_miss_rate > _thr):
+                want = min(current + 1, 2)          # under pressure -> cheaper
+            elif (ba < BUFFERED_WATERMARK_HARD * SALSIFY_SOFT_FRAC * 0.5
+                    and self.recv_miss_rate < SALSIFY_MISS_CLEAR):
+                want = max(current - 1, 0)          # clearly calm -> richer
             else:
-                self.quality_streaks[stream] = 0
+                want = current                      # dead band -> hold
+            self.desired_levels[stream] = want
 
+    def _apply_pending_quality(self, frame_id: int) -> bool:
+        """Commit any wanted level change. Caller must only invoke this on a
+        frame that is already going to be an IDR.
+
+        A QP change means a new encoder, and a new encoder emits an IDR. Applied
+        on an arbitrary frame that costs an extra intra frame on a link where
+        intra frames are what dies; applied on a frame that was going to be an
+        IDR anyway it costs nothing. Returns True if anything changed.
+        """
+        changed = False
+        # Hold a committed level for a minimum number of GOPs. Degrades bypass
+        # the hold: sitting above capacity is the expensive mistake, so the guard
+        # must never delay going DOWN -- only going back up.
+        held = (frame_id - self.last_commit_fid) // max(1, SALSIFY_GOP)
+        for stream in ("rgb", "depth"):
+            want = self.desired_levels[stream]
+            going_up = want < self.quality_levels[stream]   # lower index = richer
+            if want != self.quality_levels[stream] and going_up and held < SALSIFY_MIN_DWELL:
+                continue
+            if want != self.quality_levels[stream]:
+                logging.info(
+                    f"[Adaptive] fid={frame_id} {stream} level "
+                    f"{self.quality_levels[stream]} -> {want} "
+                    f"(miss={self.recv_miss_rate:.1f}%)"
+                )
+                self.quality_levels[stream] = want
+                self.last_commit_fid = frame_id
+                changed = True
+            self._activate_codec_qp(stream, self.quality_levels[stream])
+        return changed
+
+    def _log_quality(self, frame_id: int, ba: int) -> None:
+        """Per-GOP state line. Kept so a run can be reconstructed from the log
+        alone: level, buffer and the miss rate the level was chosen from."""
         logging.info(
             f"[Adaptive] GOP {frame_id}: levels={self.quality_levels} "
+            f"wanted={self.desired_levels} "
             f"(buffered={ba} B, miss_rate={self.recv_miss_rate:.1f}%)"
         )
 
@@ -413,23 +596,50 @@ class Sender():
                 raw = decoder[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
                 raw_depth = decoder_depth[frame_id].unsqueeze(0).unsqueeze(0).float().mul_(1.0 / 255.0)
 
-                # Check if we should force a keyframe for both streams
-                force_this_frame = False
-                if self.force_keyframe_pending:
-                    force_this_frame = True
-                    self.force_keyframe_pending = False
-                    self.last_forced_keyframe_fid = frame_id
-                    logging.info(f"[Sender] Forcing keyframe for frame {frame_id}!")
+                self.current_frame_id = frame_id
 
                 # ── Encode one active quality per stream only. ─────────────────
                 ba_rgb = self.data_channel_rgb.bufferedAmount
                 ba_depth = self.data_channel_depth.bufferedAmount
                 ba = max(ba_rgb, ba_depth)
-                is_key = frame_id == 0 or (30 > 0 and frame_id % 30 == 0) or force_this_frame
+
+                # Decide every frame, from whatever feedback has arrived by now.
                 if SALSIFY_MODE and self.args.codec == "h265":
-                    self._maybe_update_quality(frame_id=frame_id, ba=ba, is_key=is_key)
-                    self._activate_codec_qp("rgb", self.quality_levels["rgb"])
-                    self._activate_codec_qp("depth", self.quality_levels["depth"])
+                    self._decide_quality(frame_id=frame_id, ba=ba)
+
+                # A requested recovery keyframe is honoured on the very next
+                # frame -- the point of the request is to end the freeze now.
+                force_this_frame = False
+                if self.force_keyframe_pending:
+                    # How far to the next scheduled keyframe? If it is imminent the
+                    # recovery frame cannot help enough to justify its cost.
+                    _to_next = (-frame_id) % max(1, SALSIFY_GOP)
+                    if _to_next != 0 and _to_next <= SALSIFY_KF_SKIP_NEAR:
+                        self.force_keyframe_pending = False
+                        self.kf_skipped += 1
+                        logging.info(f"[Sender] Skipping recovery at {frame_id}: "
+                                     f"scheduled keyframe in {_to_next} frames")
+                    else:
+                        force_this_frame = True
+                        self.force_keyframe_pending = False
+                        self.last_forced_keyframe_fid = frame_id
+                        self.kf_forced_count += 1
+                        logging.info(f"[Sender] Forcing keyframe for frame {frame_id}!")
+
+                # frame_id % GOP is only valid while the GOP is static and no
+                # keyframe has been forced. Track the encoder's own cadence.
+                self._cur_gop = self._gop_for_level(self.quality_levels["rgb"])
+                scheduled_key = (frame_id == 0) or (frame_id >= self._next_key_fid)
+                is_key = scheduled_key or force_this_frame
+
+                # Commit any wanted level change here and only here. Both cases
+                # are frames that are already IDRs, so the rebuild the QP change
+                # forces is one we were paying for regardless -- and a recovery
+                # keyframe carries the change for free.
+                if SALSIFY_MODE and self.args.codec == "h265" and is_key:
+                    if self._apply_pending_quality(frame_id):
+                        self.qp_switches += 1
+                    self._log_quality(frame_id, ba)
                 packet_list, packet_list_depth = await asyncio.gather(
                     asyncio.to_thread(encode, self.codec, raw, frame_id, fps, force_this_frame),
                     asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps, force_this_frame),
@@ -460,8 +670,13 @@ class Sender():
                     payload_depth = out_depth["payload"]
                     qp_depth      = out_depth["qp"]
 
-                    # Update GOP id on I-frame so receiver can drop stale P-frames
+                    # Update GOP id on I-frame so receiver can drop stale P-frames.
+                    # gop_id == fid is also how the receiver identifies a
+                    # keyframe on the wire, so this must follow the encoder's
+                    # actual output and not a predicted schedule.
                     if is_key:
+                        self.kf_sent_count += 1
+                        self._next_key_fid = out_fid + max(1, self._cur_gop)
                         self.gop_id       = out_fid
                         self.gop_id_depth = out_fid
                     gop_id = self.gop_id
@@ -488,12 +703,12 @@ class Sender():
                     if is_key:
                         # I-frame: encode with FEC (50% parity overhead)
                         k_data   = max(1, (len(payload)       + self.chunk_size       - 1) // self.chunk_size)
-                        n_total  = k_data + (k_data + 1) // 2   # ceil(1.5 * k)
+                        n_total  = self._fec_n(k_data)
                         chunks, _ = self._make_iframe_chunks(payload, k_data, n_total)
                         num_chunks = n_total
 
                         k_data_depth  = max(1, (len(payload_depth) + self.chunk_size_depth - 1) // self.chunk_size_depth)
-                        n_total_depth = k_data_depth + (k_data_depth + 1) // 2
+                        n_total_depth = self._fec_n(k_data_depth)
                         chunks_depth, _ = self._make_iframe_chunks(payload_depth, k_data_depth, n_total_depth)
                         num_chunks_depth = n_total_depth
                     else:
@@ -534,11 +749,28 @@ class Sender():
                         )
 
                     async def _pace():
-                        """Sleep until the next pacing slot."""
+                        """Sleep until the next pacing slot, flushing any duplicates
+                        whose delay has elapsed. Draining here (rather than in a
+                        separate task) keeps the copies inside the normal pacing
+                        rhythm instead of bursting them out together."""
                         nonlocal idx
                         target_t = t_send0 + per_pkt_dt * (idx + 1)
                         idx += 1
                         await asyncio.sleep(max(0.0, target_t - time.perf_counter()))
+                        if self._dup_queue:
+                            now_d = time.perf_counter()
+                            keep = []
+                            for due, chan, pkt in self._dup_queue:
+                                if due <= now_d:
+                                    try:
+                                        (self.data_channel_rgb if chan == "rgb"
+                                         else self.data_channel_depth).send(pkt)
+                                        self.dup_sent += 1
+                                    except Exception:
+                                        pass
+                                else:
+                                    keep.append((due, chan, pkt))
+                            self._dup_queue = keep
 
                     # Phase 1: interleaved RGB + depth (while both streams still have chunks)
                     while chunk_idx < num_chunks and chunk_idx_depth < num_chunks_depth:
@@ -634,8 +866,15 @@ class Sender():
                     # The first chunk carries the slice header that the codec needs
                     # to begin decoding, so one extra copy improves delivery odds.
                     if not is_key and first_rgb_packet and first_depth_packet:
-                        self.data_channel_rgb.send(first_rgb_packet)
-                        self.data_channel_depth.send(first_depth_packet)
+                        if SALSIFY_DUP_DELAY_MS > 0:
+                            # Hold the copy so it lands outside the burst that may
+                            # be swallowing the original. Same bytes, later slot.
+                            due = time.perf_counter() + SALSIFY_DUP_DELAY_MS / 1000.0
+                            self._dup_queue.append((due, "rgb",   first_rgb_packet))
+                            self._dup_queue.append((due, "depth", first_depth_packet))
+                        else:
+                            self.data_channel_rgb.send(first_rgb_packet)
+                            self.data_channel_depth.send(first_depth_packet)
                         self.p_bytes_sent        += len(first_rgb_packet)
                         self.p_bytes_depth_sent  += len(first_depth_packet)
                         self.total_bytes_sent     += len(first_rgb_packet)
@@ -703,8 +942,15 @@ class Sender():
                 elif msg.startswith("KEYFRAME_REQUEST:"):
                     requested_fid = int(msg[len("KEYFRAME_REQUEST:"):])
                     if requested_fid >= 0:
-                        current_fid = getattr(self, "sent_frames", 0)
-                        if current_fid - self.last_forced_keyframe_fid >= 30:
+                        # Cooldown must be measured on the loop index, the same
+                        # clock last_forced_keyframe_fid is written from.
+                        # sent_frames is a count of frames actually put on the
+                        # wire, so back-pressure drops make it drift below
+                        # frame_id and the cooldown silently grows longer than
+                        # intended -- suppressing exactly the recoveries wanted
+                        # during the congestion that caused the drops.
+                        current_fid = self.current_frame_id
+                        if current_fid - self.last_forced_keyframe_fid >= SALSIFY_KF_COOLDOWN:
                             self.force_keyframe_pending = True
                             logging.info(f"[Feedback] Received KEYFRAME_REQUEST for frame {requested_fid}, current frame {current_fid}. Setting pending force keyframe.")
                         else:
@@ -816,6 +1062,24 @@ class Sender():
                         f"Headers RGB:   {self.reliable_bytes_meta/1e6:.2f} MB\n"
                         f"Headers depth: {self.reliable_bytes_meta_depth/1e6:.2f} MB"
                     )
+                    if SALSIFY_MODE:
+                        # Everything needed to diagnose a run from the log alone.
+                        # keyframes_sent above the schedule means IDRs are being
+                        # injected somewhere they were not accounted for.
+                        # Forced keyframes reset x265's keyint, so they SHIFT the
+                        # schedule rather than adding to it -- measured: 306 sent,
+                        # 28 forced, 278 non-forced against a naive 288. Subtracting
+                        # forced from a fixed schedule therefore over-counts. Report
+                        # the naive schedule for reference and do not derive an
+                        # "unscheduled" figure from it.
+                        _sched = self.sent_frames // max(1, SALSIFY_GOP)
+                        logging.info(
+                            f"[Adaptive Summary] qp_switches={self.qp_switches} "
+                            f"forced_keyframes={self.kf_forced_count} "
+                            f"keyframes_sent={self.kf_sent_count} scheduled~={_sched} "
+                            f"non_forced={self.kf_sent_count - self.kf_forced_count} "
+                            f"final_levels={self.quality_levels}"
+                        )
 
                     await self.pc.close()
                     logging.info("[Sender] PeerConnection closed")

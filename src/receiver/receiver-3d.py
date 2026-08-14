@@ -46,6 +46,7 @@ import struct
 import threading
 from zfec import Decoder
 import os
+import collections
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,6 +55,37 @@ RED   = "\033[31m"
 GREEN = '\033[32m'
 BLUE  = '\033[34m'
 RESET = '\033[0m'
+
+# How long the decode worker waits for the very first keyframe before giving up
+# on that frame id and moving on. Must be finite: an unbounded wait means a lost
+# frame 0 stalls the run forever and it finishes with zero decoded frames.
+STARTUP_WAIT_S = float(os.environ.get("REVO_STARTUP_WAIT_S", "2.0"))
+
+# Minimum gap between successive keyframe-recovery requests.
+KF_RETRY_S = float(os.environ.get("REVO_KF_RETRY_S", "0.25"))
+
+# Keyframe interval. Must match the sender's SALSIFY_GOP: it is the fallback the
+# receiver uses to locate I-frame positions when a frame never arrives and there
+# is therefore no wire header to read the flag from.
+REVO_GOP = int(os.environ.get("REVO_GOP", "30"))
+
+# Correct the display-clock origin so deadlines are measured from the fid the
+# clock actually started on. Off by default: it removes ~1 s of accumulated
+# slack, which is right for a real-time system but is a behaviour change.
+REVO_FIX_CLOCK = int(os.environ.get("REVO_FIX_CLOCK", "0"))
+
+# Explicit playout buffer, in milliseconds.
+#
+# Every result so far depended on an ACCIDENTAL buffer: the receiver usually
+# started at fid 30 (frame 0's keyframe being lost), and deadline(fid) counts
+# (fid+1) from the clock start, so starting late silently granted ~1 s of slack.
+# That slack is what absorbed loss bursts (p90 = 60 ms) and late retransmissions.
+# Measured when it disappeared -- starting at fid 0 instead of 30 -- lost P-frames
+# went 167 -> 523 and frozen 3.8% -> 11.4%.
+#
+# Make it a parameter instead of an artefact, so the latency/resilience trade is
+# chosen rather than inherited. 1000 ms reproduces the historical behaviour.
+REVO_PLAYOUT_MS = float(os.environ.get("REVO_PLAYOUT_MS", "1000"))
 
 # ---------------------------------------------------------------------------
 # Control-plane message types sent over the reliable DataChannel
@@ -125,14 +157,14 @@ class Receiver():
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
-        self.codec = h265.H265VideoCodec(intra_period=30)
+        self.codec = h265.H265VideoCodec(intra_period=REVO_GOP)
         if args.codec == "dcvcrt":
             self.codec = dcvc.DCVCVideoCodec()
         if args.codec == "h264":
             self.codec = h264.H264VideoCodec(intra_period=30)
 
         # Depth codec (mirrors RGB codec choice)
-        self.depth_codec = h265.H265VideoCodec(intra_period=30)
+        self.depth_codec = h265.H265VideoCodec(intra_period=REVO_GOP)
         if args.codec == "dcvcrt":
             self.depth_codec = dcvc.DCVCVideoCodec()
         if args.codec == "h264":
@@ -197,9 +229,17 @@ class Receiver():
         # deadline, so the sender can lower quality before more frames are lost.
         self.feedback_channel   = None  # rgb DataChannel, captured when it opens
         self.loop               = None  # event loop, for sends from worker threads
-        self.fb_interval        = 30    # frames between reports (~1 s at 30 fps)
+        # Reporting cadence and measurement window are deliberately separate.
+        # Reporting every 30 frames meant the sender acted on data up to a second
+        # old. Simply reporting every 5 frames instead makes the number useless
+        # the other way: over a 5-frame span a single loss reads as 20%, and the
+        # controller chases that noise. So report often (fresh) but measure over
+        # a longer trailing window (stable).
+        self.fb_interval        = int(os.environ.get("REVO_FB_INTERVAL", "5"))
+        self.fb_window          = int(os.environ.get("REVO_FB_WINDOW",  "30"))
         self.fb_last_sent_frame = 0     # frame id of the previous report
         self.fb_last_missed     = 0     # miss count at the previous report
+        self.fb_hist            = collections.deque()  # (fid, cumulative_missed)
 
         # ── GOP / P-frame continuity ─────────────────────────────────────────
         # Tracks which I-frame the decoder last successfully decoded.
@@ -282,9 +322,26 @@ class Receiver():
     def _deadline_time(self, fid: int, caller=None) -> float:
         """
         Wall-clock deadline for frame fid: the moment it should be displayed.
-        deadline(fid) = clock_t0 + (fid + 1) * T
+        deadline(fid) = clock_t0 + (fid - clock_fid0 + 1) * T
+
+        clock_t0 is stamped when the FIRST decodable keyframe arrives, and that
+        keyframe is not necessarily fid 0 -- it is whichever keyframe survived,
+        commonly fid 30. Counting (fid + 1) from that instant therefore treats a
+        frame already in hand as due a whole GOP later, and every subsequent
+        deadline inherits the same offset. Measured consequence: keyframe-loss
+        feedback reached the sender 36 frames after the event, so with a 30-frame
+        GOP the next scheduled keyframe always beat the recovery frame and
+        recovery could never help (0 of 35 requests arrived early).
+
+        self.clock_fid0 existed and was never assigned, so the correction was
+        clearly intended upstream. Gated because removing the offset also removes
+        a second of slack that late packets were quietly using.
         """
-        return self.clock_t0 + (fid + 1) * self.T
+        # Deadlines are measured from the fid the clock started on, plus an
+        # explicit playout buffer. Without the explicit term the buffer would be
+        # clock_fid0 * T -- i.e. whatever the network happened to lose at startup.
+        return (self.clock_t0 + (fid - self.clock_fid0 + 1) * self.T
+                + REVO_PLAYOUT_MS / 1000.0)
 
     # ────────────────────────────────────────────────────────────────────────
     # Best-effort payload builder (P-frames with missing chunks)
@@ -367,6 +424,37 @@ class Receiver():
         """
         print(f"{RED}Decode worker thread start{RESET}")
         while not self.stop_threads.is_set():
+            # Before the clock starts we are hunting for ANY decodable keyframe.
+            # Walking fids in order and waiting STARTUP_WAIT_S on each is fatal:
+            # if frame 0 is lost, reaching the next keyframe 30 frames later takes
+            # 30 x STARTUP_WAIT_S, by which time its shards have been evicted and
+            # the run never starts at all (observed: sender sent 8640 frames, the
+            # receiver displayed 0). Jump straight to a keyframe that has actually
+            # arrived instead.
+            if not self.clock_started:
+                # Do NOT consume frame ids before the stream starts. The worker
+                # runs as soon as the receiver launches, but the sender may not
+                # begin for several seconds; advancing expected_frame during that
+                # window retires fids that have not arrived yet, and when their
+                # data finally shows up they are already in done_fids -- the run
+                # then produces zero frames. Wait for a decodable keyframe and
+                # jump to it instead of walking forward.
+                with self.fc_lock:
+                    cands = [f for f, c in self.frame_content.items()
+                             if c and c.get("is_key")
+                             and c.get("k_data") is not None
+                             and c.get("recv_count", 0) >= int(c["k_data"])]
+                    if cands:
+                        nxt = min(cands)
+                        if nxt != int(self.expected_frame):
+                            logging.info(f"[RESYNC] starting at first decodable "
+                                         f"keyframe fid={nxt}")
+                            self.expected_frame = nxt
+                    else:
+                        # nothing decodable yet -- hold position, do not advance
+                        self.fc_cv.wait(timeout=0.05)
+                        continue
+
             fid    = int(self.expected_frame)
             with self.fc_cv:
                 fc = self.frame_content.get(fid)
@@ -375,9 +463,17 @@ class Receiver():
             # Deadline for this frame = display time of the previous frame
             deadline = self._deadline_time(fid - 1, "decode")
             if not self.clock_started:
-                deadline = 9999999999  # block indefinitely until first I-frame arrives
-            elif self.keyframe_request_pending:
-                deadline += 0.300
+                # Bounded, not infinite. Waiting forever means that if frame 0 is
+                # lost the run produces no output at all and fails silently --
+                # the cause of several empty result sets. After the bound we give
+                # up on this fid and move on; the clock starts on whichever
+                # keyframe does arrive.
+                deadline = time.perf_counter() + min(STARTUP_WAIT_S, 0.25)
+            # No padding while a keyframe request is outstanding. Holding the
+            # deadline open stalls the display for the whole padding window on
+            # every request, which is a guaranteed freeze paid up front against
+            # a recovery frame that may not arrive. Better to freeze one frame
+            # and recover on the next keyframe than to stall unconditionally.
 
             # ── Wait for full assembly or deadline ───────────────────────────
             while True:
@@ -410,6 +506,7 @@ class Receiver():
                         if (not self.clock_started) and is_key:
                             print(f"{RED}Starting deadline clock.{RESET}")
                             self.clock_started  = True
+                            self.clock_fid0     = fid   # origin for all deadlines
                             # Give ~1 frame of buffer before the first deadline fires
                             self.clock_t0       = max(self.first_packet_clock + self.T,
                                                       time.perf_counter() + 0.066)
@@ -500,7 +597,12 @@ class Receiver():
                 # Loss detection for keyframes: if payload or payload_depth is None and it is a keyframe
                 if is_key and (payload is None or payload_depth is None):
                     now = time.perf_counter()
-                    if not self.keyframe_request_pending or (now - self.last_keyframe_request_time >= 1.0):
+                    # Retry gap, not a fixed 1 s. If the recovery keyframe is
+                    # itself lost -- likely, since the link was bad enough to
+                    # kill the original -- a 1 s gap means a second full GOP of
+                    # freeze before we ask again. Short enough to retry inside
+                    # the same bad patch, long enough not to storm the sender.
+                    if not self.keyframe_request_pending or (now - self.last_keyframe_request_time >= KF_RETRY_S):
                         self.last_keyframe_request_time = now
                         self.keyframe_request_pending = True
                         if self.feedback_channel is not None and self.loop is not None:
@@ -518,9 +620,15 @@ class Receiver():
                 # from several points in the pipeline, so counting locally would
                 # understate the total and let the ratio exceed 100%.
                 missed = self.lost_frames_full + self.lost_frames_partial
+                self.fb_hist.append((fid, missed))
+                while len(self.fb_hist) > 1 and fid - self.fb_hist[0][0] > self.fb_window:
+                    self.fb_hist.popleft()
                 span   = fid - self.fb_last_sent_frame
                 if span >= self.fb_interval:
-                    rate = min(100.0, 100.0 * (missed - self.fb_last_missed) / max(1, span))
+                    # Rate over the trailing window, not since the last report.
+                    base_fid, base_missed = self.fb_hist[0]
+                    win = max(1, fid - base_fid)
+                    rate = min(100.0, 100.0 * (missed - base_missed) / win)
                     self.fb_last_sent_frame = fid
                     self.fb_last_missed     = missed
                     # Runs on the decode worker thread, so the send has to be
@@ -670,7 +778,12 @@ class Receiver():
 
         while not self.stop_threads.is_set():
             now        = time.perf_counter()
-            target_fid = int((now - clock_t0) / T)   # frame we "should" be at right now
+            # Same origin as _deadline_time, or display and decode disagree by a
+            # whole GOP and the fast-forward loop chases a target that is offset.
+            # Same origin and same buffer as _deadline_time, or display and decode
+            # disagree and the fast-forward loop chases a shifted target.
+            target_fid = (int((now - clock_t0 - REVO_PLAYOUT_MS / 1000.0) / T)
+                          + self.clock_fid0)
 
             # Sleep until the next frame is due
             next_time = self._deadline_time(self.display_next_fid, "display")
