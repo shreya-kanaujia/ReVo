@@ -24,7 +24,7 @@ Signaling:
   once both DataChannels are open.
 """
 
-import argparse, asyncio, logging
+import argparse, asyncio, logging, os, sys
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiohttp import ClientSession
 import aiohttp
@@ -34,15 +34,16 @@ from torchcodec.decoders import VideoDecoder
 import torch
 import DCVCRT_wrapper as dcvc
 import H265_wrapper as h265
+import H265_wrapper_v2 as h265_gcc
 import H264_wrapper as h264
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from gcc_controller import SenderGccController
 import time, json
 import math
 import random
 import struct
 from zfec import Encoder
-import os
 import subprocess
-import sys
 import bisect
 
 # ANSI color codes for log readability
@@ -90,6 +91,7 @@ BUFFERED_WATERMARK_HARD = 128 * 1024  # 128 KB
 # spacing with SALSIFY_DUP_DELAY_MS=0 (stock behaviour).
 # ─────────────────────────────────────────────────────────────────────────────
 SALSIFY_MODE        = int(os.environ.get("SALSIFY_MODE", "1"))
+REVO_GCC_MODE       = int(os.environ.get("REVO_GCC_MODE", "0"))
 SALSIFY_RGB_QP_HI   = int(os.environ.get("SALSIFY_RGB_QP_HI", "25"))
 SALSIFY_RGB_QP_MID  = int(os.environ.get("SALSIFY_RGB_QP_MID", "30"))
 SALSIFY_RGB_QP_LO   = int(os.environ.get("SALSIFY_RGB_QP_LO", "35"))
@@ -195,7 +197,7 @@ FRAME_TYPE_DEPTH = 4
 #         (raw shard bytes follow immediately after)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIdI" if REVO_GCC_MODE else "<BBIIBHHHI"
 SZ_INIT  = struct.calcsize(FMT_INIT)
 SZ_DESC  = struct.calcsize(FMT_DESC)
 
@@ -217,6 +219,7 @@ class Sender():
     def __init__(self, args):
         self.args          = args
         self.trace_process = None  # subprocess handle for the TC network trace
+        logging.info(f"[Sender] Loaded SALSIFY_DUP_DELAY_MS = {SALSIFY_DUP_DELAY_MS} ms")
 
         # ── Chunk sizes ──────────────────────────────────────────────────────
         self.chunk_size       = 1024   # bytes per RGB chunk / FEC shard
@@ -260,23 +263,29 @@ class Sender():
         # Duplicates held back for delayed transmission: (due_time, chan, packet).
         self._dup_queue       = []
         self.dup_sent         = 0   # delayed duplicates actually transmitted
+        self._dup_evidence_logged = False
         self._next_key_fid    = 0
         self._cur_gop         = SALSIFY_GOP
         self.kf_sent_count    = 0   # keyframes actually emitted by the encoder
         self.kf_forced_count  = 0   # of those, ones triggered by a request
         self.force_keyframe_pending = False
         self.last_forced_keyframe_fid = -999
+        self.gcc = SenderGccController() if REVO_GCC_MODE else None
+        self.global_seq_num = 0
+        self._gcc_pacing_debt_s = 0.0
+        logging.info(f"[GCC] enabled={bool(REVO_GCC_MODE)}")
 
         # ── Codec selection ──────────────────────────────────────────────────
         # RGB codec
-        self.codec = h265.H265VideoCodec(intra_period=SALSIFY_GOP, qp=SALSIFY_RGB_QP_MID)
+        codec_cls = h265_gcc.H265VideoCodec if REVO_GCC_MODE else h265.H265VideoCodec
+        self.codec = codec_cls(intra_period=SALSIFY_GOP, qp=SALSIFY_RGB_QP_MID)
         if args.codec == "dcvcrt":
             self.codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
             self.codec = h264.H264VideoCodec(intra_period=30)
 
         # Depth codec (mirrors RGB codec choice)
-        self.depth_codec = h265.H265VideoCodec(intra_period=SALSIFY_GOP, qp=SALSIFY_DEPTH_QP_MID)
+        self.depth_codec = codec_cls(intra_period=SALSIFY_GOP, qp=SALSIFY_DEPTH_QP_MID)
         if args.codec == "dcvcrt":
             self.depth_codec = dcvc.DCVCVideoCodec(intra_period=30)
         if args.codec == "h264":
@@ -399,6 +408,31 @@ class Sender():
         enc         = Encoder(k_data, n_total)
         chunks      = enc.encode(data_shards)  # length n_total
         return chunks, chunk_len
+
+    def _build_desc(self, frame_type, fid, gop_id, qp, chunk_idx,
+                    num_chunks, k_data, total_size):
+        fields = (MSG_DESC, frame_type, int(fid), int(gop_id), int(qp),
+                  int(chunk_idx), int(num_chunks), int(k_data), int(total_size))
+        if not REVO_GCC_MODE:
+            return struct.pack(FMT_DESC, *fields)
+        self.global_seq_num += 1
+        return struct.pack(FMT_DESC, *fields, time.perf_counter(),
+                           self.global_seq_num)
+
+    async def _gcc_pace(self, packet_size):
+        """Mentor GCC pacer: drain media at 1.5 times the target rate."""
+        if not REVO_GCC_MODE:
+            return
+        rate = max(self.gcc.min_rate, self.gcc.target_rate_bps) * 1.5
+        self._gcc_pacing_debt_s += packet_size * 8.0 / rate
+        if self._gcc_pacing_debt_s >= 0.005:
+            delay = self._gcc_pacing_debt_s
+            self._gcc_pacing_debt_s = 0.0
+            started = time.perf_counter()
+            await asyncio.sleep(delay)
+            oversleep = time.perf_counter() - started - delay
+            if oversleep > 0:
+                self._gcc_pacing_debt_s -= min(oversleep, 0.05)
 
     # ────────────────────────────────────────────────────────────────────────
     # Adaptive quality helpers
@@ -589,8 +623,13 @@ class Sender():
         try:
             decoder       = VideoDecoder(self.media_file,       device="cpu")
             decoder_depth = VideoDecoder(self.media_file_depth, device="cpu")
-            fps           = FPS_FALLBACK
-            logging.info(f"[Sender] Starting stream: {len(decoder)} frames @ {fps} FPS")
+            fps = decoder.metadata.average_fps or FPS_FALLBACK
+            fps = int(fps)
+            max_frames = int(os.environ.get("REVO_MAX_FRAMES", "0"))
+            num_frames = len(decoder)
+            if max_frames > 0:
+                num_frames = min(num_frames, max_frames)
+            logging.info(f"[Sender] Starting stream: {num_frames} frames @ {fps} FPS")
 
             # Codec wrappers are not async, so run them in a thread pool.
             def encode(codec, raw_tensor, fid, current_fps, force_keyframe=False):
@@ -605,7 +644,7 @@ class Sender():
             t0             = None          # wall time of frame 1 (used for pacing)
             frame_interval = 1.0 / fps
 
-            for frame_id in range(len(decoder)):
+            for frame_id in range(num_frames):
                 # Anchor the pacing clock at frame 1 (frame 0 may have a long
                 # first-encode warm-up that would skew all subsequent deadlines)
                 if frame_id == 1:
@@ -659,9 +698,14 @@ class Sender():
                     if self._apply_pending_quality(frame_id):
                         self.qp_switches += 1
                     self._log_quality(frame_id, ba)
+                # In GCC mode every predicted GOP boundary is explicitly sent
+                # as an IDR. This lets the v2 wrapper apply a pending QP exactly
+                # where the current wire GOP schedule says the boundary is,
+                # including after a recovery keyframe has shifted that schedule.
+                encode_key = force_this_frame or (REVO_GCC_MODE and is_key)
                 packet_list, packet_list_depth = await asyncio.gather(
-                    asyncio.to_thread(encode, self.codec, raw, frame_id, fps, force_this_frame),
-                    asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps, force_this_frame),
+                    asyncio.to_thread(encode, self.codec, raw, frame_id, fps, encode_key),
+                    asyncio.to_thread(encode, self.depth_codec, raw_depth, frame_id, fps, encode_key),
                 )
                 
                 t_send0 = time.perf_counter()
@@ -754,28 +798,28 @@ class Sender():
                     first_depth_packet = None
 
                     def _build_rgb_hdr():
-                        return struct.pack(
-                            FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
-                            int(out_fid), int(gop_id), int(qp),
-                            int(chunk_idx), int(num_chunks), int(k_data), int(len(payload))
-                        )
+                        return self._build_desc(
+                            FRAME_TYPE_RGB, out_fid, gop_id, qp, chunk_idx,
+                            num_chunks, k_data, len(payload))
 
                     def _build_depth_hdr():
-                        return struct.pack(
-                            FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
-                            int(out_fid), int(gop_id), int(qp_depth),
-                            int(chunk_idx_depth), int(num_chunks_depth), int(k_data_depth), int(len(payload_depth))
-                        )
+                        return self._build_desc(
+                            FRAME_TYPE_DEPTH, out_fid, gop_id, qp_depth,
+                            chunk_idx_depth, num_chunks_depth, k_data_depth,
+                            len(payload_depth))
 
-                    async def _pace():
+                    async def _pace(packet_size):
                         """Sleep until the next pacing slot, flushing any duplicates
                         whose delay has elapsed. Draining here (rather than in a
                         separate task) keeps the copies inside the normal pacing
                         rhythm instead of bursting them out together."""
                         nonlocal idx
-                        target_t = t_send0 + per_pkt_dt * (idx + 1)
-                        idx += 1
-                        await asyncio.sleep(max(0.0, target_t - time.perf_counter()))
+                        if REVO_GCC_MODE:
+                            await self._gcc_pace(packet_size)
+                        else:
+                            target_t = t_send0 + per_pkt_dt * (idx + 1)
+                            idx += 1
+                            await asyncio.sleep(max(0.0, target_t - time.perf_counter()))
                         if self._dup_queue:
                             now_d = time.perf_counter()
                             keep = []
@@ -785,6 +829,14 @@ class Sender():
                                         (self.data_channel_rgb if chan == "rgb"
                                          else self.data_channel_depth).send(pkt)
                                         self.dup_sent += 1
+                                        if not self._dup_evidence_logged:
+                                            logging.info(
+                                                "[Duplicate] first delayed copy sent "
+                                                "configured_delay_ms=%.1f deadline_lateness_ms=%.3f",
+                                                SALSIFY_DUP_DELAY_MS,
+                                                max(0.0, now_d - due) * 1000.0,
+                                            )
+                                            self._dup_evidence_logged = True
                                     except Exception:
                                         pass
                                 else:
@@ -814,7 +866,7 @@ class Sender():
                             self.p_bytes_sent += len(packet)
                         self.total_bytes_sent += len(packet)
                         chunk_idx += 1
-                        await _pace()
+                        await _pace(len(packet))
 
                         # Depth chunk
                         hdr_d   = _build_depth_hdr()
@@ -837,7 +889,7 @@ class Sender():
                             self.p_bytes_depth_sent += len(packet_d)
                         self.total_bytes_depth_sent += len(packet_d)
                         chunk_idx_depth += 1
-                        await _pace()
+                        await _pace(len(packet_d))
 
                     # Phase 2: drain any remaining RGB chunks (if RGB had more than depth)
                     while chunk_idx < num_chunks:
@@ -858,7 +910,7 @@ class Sender():
                             self.p_bytes_sent += len(packet)
                         self.total_bytes_sent += len(packet)
                         chunk_idx += 1
-                        await _pace()
+                        await _pace(len(packet))
 
                     # Phase 3: drain any remaining depth chunks
                     while chunk_idx_depth < num_chunks_depth:
@@ -879,7 +931,7 @@ class Sender():
                             self.p_bytes_depth_sent += len(packet_d)
                         self.total_bytes_depth_sent += len(packet_d)
                         chunk_idx_depth += 1
-                        await _pace()
+                        await _pace(len(packet_d))
 
                     # Phase 4 (P-frames only): retransmit chunk 0 of both streams.
                     # The first chunk carries the slice header that the codec needs
@@ -906,17 +958,35 @@ class Sender():
                             "Sent frame %04d (%s) RGB=%d B depth=%d B",
                             out_fid, "I" if is_key else "P", len(payload), len(payload_depth)
                         )
+                        if REVO_GCC_MODE:
+                            logging.info(
+                                "[GCC] actuation fid=%d actual_qp=%d "
+                                "target_qp=%d target_rate_bps=%.0f payload_bytes=%d",
+                                out_fid, qp, self.gcc.target_qp,
+                                self.gcc.target_rate_bps,
+                                len(payload) + len(payload_depth),
+                            )
+
+                if REVO_GCC_MODE and frame_deadline is not None:
+                    # GCC controls packet spacing within the frame, but it must
+                    # not make an application-limited source run faster than its
+                    # native cadence. Preserve the existing 25 FPS source clock
+                    # by waiting out any unused portion of this frame slot.
+                    await asyncio.sleep(max(
+                        0.0, frame_deadline - time.perf_counter()))
 
             # ── Encoder flush ────────────────────────────────────────────────
             # H.265 and H264 codecs may buffer a few frames internally; flush them.
-            if isinstance(self.codec, (h265.H265VideoCodec, h264.H264VideoCodec)):
+            if isinstance(self.codec, (h265.H265VideoCodec,
+                                       h265_gcc.H265VideoCodec,
+                                       h264.H264VideoCodec)):
                 for out in self.codec.flush(fps=fps):
                     payload = out["payload"]
                     out_fid = out["frame_id"]
                     is_key  = out["is_key"]
                     qp      = out["qp"]
-                    hdr = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_RGB,
-                                      int(out_fid), int(gop_id), int(qp), 0, 1, 1, int(len(payload)))
+                    hdr = self._build_desc(FRAME_TYPE_RGB, out_fid, gop_id,
+                                           qp, 0, 1, 1, len(payload))
                     self.data_channel_rgb.send(hdr + payload)
                     self.i_bytes_sent        += len(hdr) + len(payload)
                     self.total_bytes_sent    += len(hdr) + len(payload)
@@ -930,8 +1000,9 @@ class Sender():
                     out_fid_d     = out_d["frame_id"]
                     is_key        = out_d["is_key"]
                     qp_depth      = out_d["qp"]
-                    hdr_d = struct.pack(FMT_DESC, MSG_DESC, FRAME_TYPE_DEPTH,
-                                        int(out_fid), int(gop_id), int(qp_depth), 0, 1, 1, int(len(payload_depth)))
+                    hdr_d = self._build_desc(FRAME_TYPE_DEPTH, out_fid, gop_id,
+                                             qp_depth, 0, 1, 1,
+                                             len(payload_depth))
                     self.data_channel_depth.send(hdr_d + payload_depth)
                     self.i_bytes_depth_sent       += len(hdr_d) + len(payload_depth)
                     self.total_bytes_depth_sent   += len(hdr_d) + len(payload_depth)
@@ -944,6 +1015,7 @@ class Sender():
 
         except Exception as e:
             logging.exception(f"[Sender] Error in stream_video: {e}")
+            raise
 
     # ────────────────────────────────────────────────────────────────────────
     # Main async entry point
@@ -977,6 +1049,31 @@ class Sender():
         except Exception as exc:
             logging.warning(f"[Feedback] could not parse '{msg}': {exc}")
 
+    def _handle_gcc_message(self, message):
+        if not REVO_GCC_MODE:
+            return
+        try:
+            data = json.loads(message)
+            if data.get("type") != "remb_feedback":
+                return
+            changed = self.gcc.update(data)
+            logging.info(
+                "[GCC] feedback A=%.3fMbps A_r=%.3fMbps A_s=%.3fMbps "
+                "loss=%.2f%% state=%s requested_qp=%d changed=%s",
+                self.gcc.target_rate_bps / 1e6,
+                self.gcc.remote_rate_bps / 1e6,
+                self.gcc.loss_rate_bps / 1e6,
+                float(data.get("loss_rate", 0.0)) * 100.0,
+                data.get("state", "unknown"), self.gcc.target_qp, changed,
+            )
+            if changed:
+                self.codec.set_qp(self.gcc.target_qp)
+                self.depth_codec.set_qp(self.gcc.target_qp)
+                logging.info("[GCC] queued QP=%d for synchronized GOP boundary",
+                             self.gcc.target_qp)
+        except Exception as exc:
+            logging.warning("[GCC] invalid feedback %r: %s", message, exc)
+
     async def run(self):
         """
         Connect to the signaling server, negotiate WebRTC, wait for both
@@ -989,6 +1086,8 @@ class Sender():
         # real-time video, so we skip retransmission at the SCTP layer entirely.
         self.data_channel_rgb   = self.pc.createDataChannel("rgb_payload",   ordered=False, maxRetransmits=0)
         self.data_channel_depth = self.pc.createDataChannel("depth_payload", ordered=False, maxRetransmits=0)
+        self.data_channel_ctrl = (self.pc.createDataChannel(
+            "control_feedback", ordered=True) if REVO_GCC_MODE else None)
 
         self.i_open = asyncio.Event()   # set when rgb_payload channel is open
         self.p_open = asyncio.Event()   # set when depth_payload channel is open
@@ -1008,6 +1107,15 @@ class Sender():
         def on_depth_open():
             logging.info("depth_payload channel open")
             self.p_open.set()
+
+        if self.data_channel_ctrl is not None:
+            @self.data_channel_ctrl.on("open")
+            def on_ctrl_open():
+                logging.info("control_feedback channel open")
+
+            @self.data_channel_ctrl.on("message")
+            def on_ctrl_message(message):
+                self._handle_gcc_message(message)
 
         @self.data_channel_rgb.on("message")
         def on_rgb_message(msg):
@@ -1106,7 +1214,8 @@ class Sender():
                     logging.info("[Sender] WebSocket closed")
 
         except Exception as e:
-            logging.error(f"[Sender] Error during execution: {e}")
+            logging.exception(f"[Sender] Error during execution: {e}")
+            raise
         finally:
             # Always clean up TC rules even on crash / KeyboardInterrupt
             self.stop_trace()

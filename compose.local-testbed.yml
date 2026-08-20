@@ -1,0 +1,90 @@
+services:
+  signaling:
+    image: revo-local-testbed
+    container_name: revo-signaling
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    command: bash -c "trap 'kill -INT $$child 2>/dev/null; wait $$child; exit 0' INT TERM; python -u src/signalling_server.py > output/temp_signaling.log 2>&1 & child=$$!; wait $$child"
+
+  receiver:
+    image: revo-local-testbed
+    container_name: revo-receiver
+    depends_on:
+      - signaling
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REVO_PLAYOUT_MS
+      - REVO_GOP
+      - REVO_FB_INTERVAL
+      - REVO_FB_WINDOW
+      - REVO_KF_RETRY_S
+      - REVO_FIX_CLOCK
+      - REVO_SOURCE_FRAMES
+      - REVO_EVAL_FULL_RUN
+      - REVO_EXPECTED_RECEIVER_SHA256
+      - REVO_EXPECTED_SENDER_SHA256
+      - REVO_EXPECTED_TC_SHA256
+      - REVO_EXPECTED_GUARD_SHA256
+      - REVO_EXPECTED_GCC_SHA256
+      - REVO_EXPECTED_GCC_CODEC_SHA256
+      - REVO_GCC_MODE
+    command: bash -c "python scripts/verify_wifi_eval_runtime.py --role receiver && sleep 3 && python -u src/receiver/receiver-3d.py --codec h265 --server_ip signaling --out output/temp_receiver_rgb.mp4 --out_depth output/temp_receiver_depth.mp4 > output/temp_receiver.log 2>&1"
+
+  sender:
+    image: revo-local-testbed
+    container_name: revo-sender
+    user: "root"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - signaling
+      - receiver
+    volumes:
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REVO_MAX_FRAMES
+      - SALSIFY_MODE
+      - REVO_GCC_MODE
+      - SALSIFY_DUP_DELAY_MS
+      - SALSIFY_RGB_QP_HI
+      - SALSIFY_RGB_QP_MID
+      - SALSIFY_RGB_QP_LO
+      - SALSIFY_DEPTH_QP_HI
+      - SALSIFY_DEPTH_QP_MID
+      - SALSIFY_DEPTH_QP_LO
+      - SALSIFY_START
+      - SALSIFY_SOFT_FRAC
+      - SALSIFY_MISS_THRESH
+      - SALSIFY_MISS_CLEAR
+      - SALSIFY_MIN_DWELL
+      - SALSIFY_GOP
+      - SALSIFY_GOP_TIERS
+      - SALSIFY_KF_COOLDOWN
+      - SALSIFY_KF_SKIP_NEAR
+      - SALSIFY_FEC_ADAPT
+      - SALSIFY_FEC_MIN
+      - SALSIFY_FEC_MAX
+      - SALSIFY_FEC_MAXPK
+      - SALSIFY_FEC_COMPENSATE
+      - REVO_GOP
+      - REVO_FB_INTERVAL
+      - REVO_FB_WINDOW
+      - REVO_KF_RETRY_S
+      - REVO_PLAYOUT_MS
+      - REVO_FIX_CLOCK
+      - REVO_EVAL_FULL_RUN
+      - REVO_EXPECTED_RECEIVER_SHA256
+      - REVO_EXPECTED_SENDER_SHA256
+      - REVO_EXPECTED_TC_SHA256
+      - REVO_EXPECTED_GUARD_SHA256
+      - REVO_EXPECTED_GCC_SHA256
+      - REVO_EXPECTED_GCC_CODEC_SHA256
+      - RGB_SOURCE
+      - DEPTH_SOURCE
+      - TRACE_PATH
+    command: bash -c "python scripts/verify_wifi_eval_runtime.py --role sender || exit $$?; sleep 6; bash scripts/capture_tc_stats.sh eth0 output/temp_tc_stats.log & TC_CAPTURE_PID=$$!; python -u src/sender/sender-3d.py --codec h265 --server_ip signaling --file $${RGB_SOURCE} --depth_file $${DEPTH_SOURCE} --trace_path $${TRACE_PATH} --tc_script src/sender/run_loss_trace.py --interface eth0 > output/temp_sender.log 2>&1; SENDER_STATUS=$$?; wait $$TC_CAPTURE_PID; TC_CAPTURE_STATUS=$$?; if [ $$SENDER_STATUS -ne 0 ]; then exit $$SENDER_STATUS; fi; exit $$TC_CAPTURE_STATUS"

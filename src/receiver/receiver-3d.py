@@ -25,10 +25,10 @@ Pipeline overview:
               _display_worker_thread       (background thread)
                         │
                         ▼
-                 saved_frames[]  ──►  write_video_pyav()
+                 streaming MP4 writer
 """
 
-import argparse, asyncio, json, logging, sys
+import argparse, asyncio, json, logging, os, sys
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaRecorder
 from aiohttp import ClientSession
@@ -45,10 +45,14 @@ import cv2
 import struct
 import threading
 from zfec import Decoder
-import os
 import collections
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from gcc_controller import ReceiverGccEstimator
 
 logging.basicConfig(level=logging.INFO)
+
+# Runtime-contract marker checked by the Wi-Fi evaluation launcher.
+WIFI_EVAL_SOURCE_WINDOW_VERSION = "2"
 
 # ANSI color codes for log readability
 RED   = "\033[31m"
@@ -86,6 +90,7 @@ REVO_FIX_CLOCK = int(os.environ.get("REVO_FIX_CLOCK", "0"))
 # Make it a parameter instead of an artefact, so the latency/resilience trade is
 # chosen rather than inherited. 1000 ms reproduces the historical behaviour.
 REVO_PLAYOUT_MS = float(os.environ.get("REVO_PLAYOUT_MS", "1000"))
+REVO_GCC_MODE = int(os.environ.get("REVO_GCC_MODE", "0"))
 
 # ---------------------------------------------------------------------------
 # Control-plane message types sent over the reliable DataChannel
@@ -106,7 +111,7 @@ MSG_CHUNK = 3   # (unused; payload is appended directly after MSG_DESC)
 #         (raw shard bytes follow immediately after the fixed header)
 # ---------------------------------------------------------------------------
 FMT_INIT = "<BHHHHH"
-FMT_DESC = "<BBIIBHHHI"
+FMT_DESC = "<BBIIBHHHIdI" if REVO_GCC_MODE else "<BBIIBHHHI"
 
 # Frame-type tags that travel in the DESC header
 FRAME_TYPE_RGB   = 3
@@ -208,9 +213,16 @@ class Receiver():
         self.last_displayed_frame  = None
         self.last_displayed_frame_depth = None
 
-        # Ordered lists of frames written to disk (same order as display)
-        self.saved_frames       = []
-        self.saved_frames_depth = []
+        # Encode output incrementally. Retaining all RGB/depth ndarrays until
+        # EOS exhausts Docker memory on full-length evaluation sources.
+        self.output_containers = None
+        self.output_streams = None
+        self.output_frame_count = 0
+
+        # The evaluation runner supplies the exact source window.  A value of
+        # zero keeps the legacy unbounded behaviour for non-evaluation runs.
+        self.source_frame_count = int(os.environ.get("REVO_SOURCE_FRAMES", "0"))
+        self.shutting_down = False
 
         # ── Counters / metrics ───────────────────────────────────────────────
         self.total_bytes_received       = 0
@@ -272,6 +284,48 @@ class Receiver():
         self._last_chunk_gc = time.perf_counter()
         self.last_keyframe_request_time = 0.0
         self.keyframe_request_pending = False
+        self.gcc = ReceiverGccEstimator() if REVO_GCC_MODE else None
+        self.gcc_channel = None
+        self.gcc_task = None
+        self.gcc_last_feedback_time = 0.0
+        self.gcc_last_sent_rate = None
+        logging.info(f"[GCC] enabled={bool(REVO_GCC_MODE)}")
+
+    async def _gcc_feedback_task(self):
+        while not self.stop_threads.is_set() and not self.shutting_down:
+            await asyncio.sleep(0.05)
+            if self.gcc_channel is None or self.gcc_channel.readyState != "open":
+                continue
+            # Match the mentor GCC implementation: estimator updates run at
+            # 50 ms, while the regular REMB/loss report is a 1 Hz fallback.
+            # Do not emit pre-stream feedback from DataChannel warm-up traffic.
+            now = time.perf_counter()
+            due = (self.gcc.max_fid >= 0 and
+                   now - self.gcc_last_feedback_time >= 1.0)
+            feedback = self.gcc.feedback(now=now, consume_loss=False)
+            # Mentor GCC emits REMB immediately when delay control lowers A_r
+            # by more than 3%; the 1 Hz report is only the fallback cadence.
+            immediate_decrease = (
+                self.gcc_last_sent_rate is not None
+                and feedback["A_r"] < 0.97 * self.gcc_last_sent_rate
+            )
+            if not due and not immediate_decrease:
+                continue
+            feedback["loss_rate"] = self.gcc._loss(consume=True)
+            try:
+                self.gcc_channel.send(json.dumps(feedback))
+                self.gcc_last_feedback_time = now
+                self.gcc_last_sent_rate = feedback["A_r"]
+                logging.info(
+                    "[GCC] feedback A_r=%.3fMbps loss=%.2f%% state=%s "
+                    "gradient=%.3fms threshold=%.3fms receive=%.3fMbps",
+                    feedback["A_r"] / 1e6, feedback["loss_rate"] * 100.0,
+                    feedback["state"], feedback["delay_gradient_ms"],
+                    feedback["threshold_ms"], feedback["receive_rate_bps"] / 1e6,
+                )
+            except Exception as exc:
+                if not self.shutting_down:
+                    logging.warning("[GCC] feedback send failed: %s", exc)
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -282,6 +336,27 @@ class Receiver():
         if self.last_decode_i_frame_id is not None:
             return (fid - self.last_decode_i_frame_id) % int(self.codec.intra_period) == 0
         return (fid % int(self.codec.intra_period) == 0)
+
+    def _send_feedback_now(self, payload: str) -> None:
+        """Send feedback on the owning event loop if transport is still open."""
+        if self.shutting_down or self.feedback_channel is None:
+            return
+        if getattr(self.feedback_channel, "readyState", None) != "open":
+            return
+        if self.pc is None or self.pc.connectionState == "closed":
+            return
+        try:
+            self.feedback_channel.send(payload)
+        except Exception as exc:
+            logging.warning(f"[Feedback] send failed for {payload!r}: {exc}")
+
+    def _schedule_feedback(self, payload: str) -> None:
+        if self.shutting_down or self.loop is None:
+            return
+        try:
+            self.loop.call_soon_threadsafe(self._send_feedback_now, payload)
+        except RuntimeError as exc:
+            logging.warning(f"[Feedback] event loop unavailable for {payload!r}: {exc}")
 
     def init_frame_content(self, fid):
         """
@@ -424,6 +499,9 @@ class Receiver():
         """
         print(f"{RED}Decode worker thread start{RESET}")
         while not self.stop_threads.is_set():
+            if (self.source_frame_count > 0
+                    and self.expected_frame >= self.source_frame_count):
+                break
             # Before the clock starts we are hunting for ANY decodable keyframe.
             # Walking fids in order and waiting STARTUP_WAIT_S on each is fatal:
             # if frame 0 is lost, reaching the next keyframe 30 frames later takes
@@ -606,13 +684,8 @@ class Receiver():
                         self.last_keyframe_request_time = now
                         self.keyframe_request_pending = True
                         if self.feedback_channel is not None and self.loop is not None:
-                            try:
-                                self.loop.call_soon_threadsafe(
-                                    self.feedback_channel.send, f"KEYFRAME_REQUEST:{fid}"
-                                )
-                                logging.info(f"[Recovery] Sent KEYFRAME_REQUEST for lost keyframe {fid}")
-                            except Exception as exc:
-                                logging.warning(f"[Recovery] Failed to send KEYFRAME_REQUEST: {exc}")
+                            self._schedule_feedback(f"KEYFRAME_REQUEST:{fid}")
+                            logging.info(f"[Recovery] Sent KEYFRAME_REQUEST for lost keyframe {fid}")
 
                 # Report the deadline-miss rate over the frames since the last
                 # report.  The span of frame ids is used as the denominator
@@ -634,12 +707,8 @@ class Receiver():
                     # Runs on the decode worker thread, so the send has to be
                     # handed back to the event loop that owns the DataChannel.
                     if self.feedback_channel is not None and self.loop is not None:
-                        try:
-                            self.loop.call_soon_threadsafe(
-                                self.feedback_channel.send, f"FB:{rate:.1f}")
-                            logging.info(f"[Feedback] miss_rate={rate:.1f}% at frame {fid}")
-                        except Exception as exc:
-                            logging.warning(f"[Feedback] send failed: {exc}")
+                        self._schedule_feedback(f"FB:{rate:.1f}")
+                        logging.info(f"[Feedback] miss_rate={rate:.1f}% at frame {fid}")
 
             # ── Decode ───────────────────────────────────────────────────────
             frame_rgb   = None
@@ -799,7 +868,7 @@ class Receiver():
 
     def _display_one(self, fid: int):
         """
-        Consume frame fid from display_buf and append it to saved_frames.
+        Consume frame fid from display_buf and encode it to the output videos.
         If the frame is not in the buffer (dropped / not yet decoded) the last
         successfully displayed frame is repeated (freeze-frame strategy).
         """
@@ -819,8 +888,58 @@ class Receiver():
             self.last_displayed_frame       = frame_rgb
             self.last_displayed_frame_depth = frame_depth
 
-        self.saved_frames.append(frame_rgb)
-        self.saved_frames_depth.append(frame_depth)
+        self._write_output_pair(frame_rgb, frame_depth)
+
+    def _ensure_output_writers(self, frame_rgb, frame_depth):
+        if self.output_containers is not None:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.media_file)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.media_file_depth)), exist_ok=True)
+        rgb_container = av.open(self.media_file, mode="w")
+        depth_container = av.open(self.media_file_depth, mode="w")
+        rgb_stream = rgb_container.add_stream("libx264", rate=self.fps)
+        depth_stream = depth_container.add_stream("libx264", rate=self.fps)
+        for stream, frame in ((rgb_stream, frame_rgb), (depth_stream, frame_depth)):
+            stream.width = frame.shape[1]
+            stream.height = frame.shape[0]
+            stream.pix_fmt = "yuv420p"
+            stream.options = {
+                "crf": "0", "preset": "ultrafast",
+                "g": str(self.codec.intra_period),
+            }
+        self.output_containers = (rgb_container, depth_container)
+        self.output_streams = (rgb_stream, depth_stream)
+
+    @staticmethod
+    def _as_rgb24(frame):
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame * 255, 0, 255).astype(np.uint8)
+        return av.VideoFrame.from_ndarray(frame, format="rgb24")
+
+    def _write_output_pair(self, frame_rgb, frame_depth):
+        self._ensure_output_writers(frame_rgb, frame_depth)
+        for container, stream, frame in zip(
+                self.output_containers, self.output_streams,
+                (frame_rgb, frame_depth)):
+            for packet in stream.encode(self._as_rgb24(frame)):
+                container.mux(packet)
+        self.output_frame_count += 1
+
+    def _finalize_output_writers(self):
+        if self.output_containers is None:
+            return
+        try:
+            for container, stream in zip(self.output_containers, self.output_streams):
+                for packet in stream.encode(None):
+                    container.mux(packet)
+                container.close()
+        finally:
+            self.output_containers = None
+            self.output_streams = None
+        logging.info(
+            "Saved %d RGB and depth frames incrementally (%d FPS, CRF=0, preset=ultrafast)",
+            self.output_frame_count, self.fps,
+        )
 
     # ────────────────────────────────────────────────────────────────────────
     # Main async entry point
@@ -853,6 +972,10 @@ class Receiver():
             # Feedback is sent back over the RGB channel, which is bidirectional.
             if channel.label == "rgb_payload":
                 self.feedback_channel = channel
+            elif channel.label == "control_feedback" and REVO_GCC_MODE:
+                self.gcc_channel = channel
+                if self.gcc_task is None:
+                    self.gcc_task = asyncio.create_task(self._gcc_feedback_task())
 
             @channel.on("message")
             async def on_message(msg):
@@ -880,8 +1003,9 @@ class Receiver():
                     if len(msg) < SZ_DESC:
                         return  # too short to be a valid DESC packet; discard
 
+                    unpacked = struct.unpack(FMT_DESC, msg[:SZ_DESC])
                     (mtype, frame_type, fid, gop_id, qp,
-                     chunk_idx, num_chunks, k_data, total_size) = struct.unpack(FMT_DESC, msg[:SZ_DESC])
+                     chunk_idx, num_chunks, k_data, total_size) = unpacked[:9]
 
                     import os
                     if os.environ.get("REVO_TEST_DROP_KEYFRAME") == "1" and int(fid) == 30:
@@ -889,6 +1013,17 @@ class Receiver():
 
                     if mtype != MSG_DESC:
                         return  # unexpected message type
+
+                    if REVO_GCC_MODE:
+                        sender_time, seq_num = unpacked[9:]
+                        receiver_time = time.perf_counter()
+                        self.gcc.observe(
+                            seq=int(seq_num), fid=int(fid),
+                            sender_time=float(sender_time),
+                            receiver_time=receiver_time, size=len(msg),
+                        )
+                        if self.gcc_last_feedback_time == 0.0:
+                            self.gcc_last_feedback_time = receiver_time
 
                     fid        = int(fid)
                     gop_id     = int(gop_id)
@@ -998,10 +1133,64 @@ class Receiver():
                             logging.info("Answer sent; ready to receive frames")
 
                         elif msg_type == "bye":
-                            # Sender has finished; drain remaining in-flight frames
-                            logging.info("[Receiver] Received bye — draining remaining frames (100 ms)")
-                            await asyncio.sleep(0.1)
+                            # Sender has finished.  Keep the transport and worker
+                            # threads alive until the explicit source window has
+                            # been classified; writing before this drain used to
+                            # truncate the tail of otherwise clean videos.
+                            logging.info("[Receiver] Received bye — draining source window")
+                            if self.source_frame_count > 0:
+                                drain_deadline = time.perf_counter() + max(
+                                    5.0, REVO_PLAYOUT_MS / 1000.0 + 3.0)
+                                while (self.expected_frame < self.source_frame_count
+                                       and time.perf_counter() < drain_deadline):
+                                    with self.fc_cv:
+                                        self.fc_cv.notify_all()
+                                    await asyncio.sleep(0.01)
+                                if self.expected_frame < self.source_frame_count:
+                                    raise RuntimeError(
+                                        "receiver source-window drain incomplete: "
+                                        f"expected_frame={self.expected_frame} "
+                                        f"source_frames={self.source_frame_count}"
+                                    )
+                                logging.info(
+                                    "[Receiver] Source window classified: "
+                                    f"0..{self.source_frame_count - 1}"
+                                )
+                            else:
+                                await asyncio.sleep(0.1)
+
                             self.stop_threads.set()
+                            with self.fc_cv:
+                                self.fc_cv.notify_all()
+                            with self.display_cv:
+                                self.display_cv.notify_all()
+
+                            if self.decode_thread:
+                                self.decode_thread.join(timeout=5.0)
+                                if self.decode_thread.is_alive():
+                                    raise RuntimeError("receiver decode thread failed to stop")
+                            if self.display_thread:
+                                self.display_thread.join(timeout=5.0)
+                                if self.display_thread.is_alive():
+                                    raise RuntimeError("receiver display thread failed to stop")
+
+                            # The display clock may legitimately lag decoding by
+                            # the configured playout buffer at EOS.  Drain already
+                            # classified source frames in order before finalizing
+                            # the MP4; missing media keeps the existing freeze-frame
+                            # semantics and is not fabricated as a successful frame.
+                            if self.source_frame_count > 0:
+                                while self.display_next_fid < self.source_frame_count:
+                                    self._display_one(self.display_next_fid)
+                                    self.display_next_fid += 1
+
+                            self.shutting_down = True
+                            if self.gcc_task is not None:
+                                self.gcc_task.cancel()
+                                try:
+                                    await self.gcc_task
+                                except asyncio.CancelledError:
+                                    pass
                             # Skipped on CPU-only hosts, where these raise and
                             # would abort the run before the videos are written.
                             if torch.cuda.is_available():
@@ -1015,9 +1204,6 @@ class Receiver():
                         break
 
                 await ws.close()
-
-                if self.pc.connectionState != "closed":
-                    await self.pc.close()
 
                 # ── Session summary ──────────────────────────────────────────
                 lost_total  = self.lost_frames_full + self.lost_frames_partial
@@ -1034,34 +1220,19 @@ class Receiver():
                 )
 
                 # ── Save video ───────────────────────────────────────────────
-                if len(self.saved_frames) > 0:
-                    os.makedirs(os.path.dirname(os.path.abspath(self.media_file)),       exist_ok=True)
-                    os.makedirs(os.path.dirname(os.path.abspath(self.media_file_depth)), exist_ok=True)
-                    try:
-                        write_video_pyav(
-                            self.saved_frames, self.saved_frames_depth,
-                            self.media_file, self.media_file_depth,
-                            self.fps, self.codec.intra_period,
-                            crf=0, preset="veryslow"
-                        )
-                        logging.info(f"Receiver: saved video to {self.media_file}")
-                    except Exception:
-                        logging.exception("[Receiver] Failed to write video with PyAV")
+                if self.output_frame_count > 0:
+                    self._finalize_output_writers()
+                    logging.info(f"Receiver: saved video to {self.media_file}")
                 else:
                     logging.warning("[Receiver] No frames decoded; nothing to write")
 
-                # Wake any blocked threads so they can exit cleanly
-                with self.fc_cv:
-                    self.fc_cv.notify_all()
-                with self.display_cv:
-                    self.display_cv.notify_all()
+                if self.pc.connectionState != "closed":
+                    await self.pc.close()
 
-                if self.decode_thread:
-                    self.decode_thread.join(timeout=1.0)
-                if self.display_thread:
-                    self.display_thread.join(timeout=1.0)
-
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass
                 logging.info("[Receiver] Graceful shutdown complete")
 
 
